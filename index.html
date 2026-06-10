@@ -87,6 +87,7 @@ a{color:inherit}
 .panel::after{bottom:5px; right:5px; border-bottom:1px solid var(--edge2); border-right:1px solid var(--edge2)}
 .col3{grid-column:span 3} .col4{grid-column:span 4} .col5{grid-column:span 5}
 .col6{grid-column:span 6} .col7{grid-column:span 7} .col8{grid-column:span 8}
+.col12{grid-column:span 12}
 @media(max-width:980px){.col3{grid-column:span 6}.col4,.col5,.col6,.col7,.col8{grid-column:span 12}}
 
 .ph{display:flex; align-items:center; gap:9px; margin:-2px 0 11px}
@@ -116,6 +117,13 @@ a{color:inherit}
 .lgi .sw{width:9px; height:9px; border-radius:2px; flex:none}
 .cnote{font-family:var(--sans); font-size:10.5px; color:var(--faint); margin-top:8px; line-height:1.45}
 .cnote b{color:var(--dim); font-weight:500}
+/* market-maker notes (bottom strip) */
+.mmrow{display:grid; grid-template-columns:150px 1fr; gap:10px; align-items:baseline; padding:5px 0;
+  border-top:1px solid var(--edge)}
+.mmrow:first-of-type{border-top:none}
+.mmrow .k{font-family:var(--mono); font-size:10px; color:var(--frontier); letter-spacing:.12em; text-transform:uppercase}
+.mmrow .t{font-family:var(--sans); font-size:11.5px; color:var(--dim); line-height:1.5}
+@media(max-width:980px){.mmrow{grid-template-columns:1fr}}
 /* ranked bars (protocols) */
 .brow{display:grid; grid-template-columns:92px 1fr 74px; gap:9px; align-items:center; margin:6px 0}
 .brow .bl{font-family:var(--mono); font-size:11px; color:var(--ink); text-align:right; text-transform:capitalize}
@@ -123,6 +131,12 @@ a{color:inherit}
 .brow .bt>i{display:block; height:100%;
   background-image:repeating-linear-gradient(90deg, oklch(0 0 0 / .2) 0 1px, transparent 1px 6px)}
 .brow .bv{font-family:var(--mono); font-size:10.5px; color:var(--dim); text-align:right}
+/* in-work protocols (tracked, not yet measured) */
+.iwsep{border-top:1px dashed var(--edge); margin:10px 0 5px}
+.brow.inwork .bl{color:var(--faint)}
+.brow.inwork .bt{opacity:.25}
+.iw{font-family:var(--mono); font-size:8px; letter-spacing:.1em; color:var(--caution);
+  border:1px solid var(--caution); border-radius:2px; padding:1px 4px; text-transform:uppercase}
 /* chart hover tooltip + crosshair */
 .chartbox{position:relative}
 .chart{cursor:crosshair}
@@ -267,7 +281,7 @@ function card(id,lab,big){
 card('cSup','Non-USD Stablecoin Supply', U(SU.total_usd)+delta(SU.total_usd,pSU.total_usd));
 card('cVol','Onchain FX Volume / wk', U(V.dedup_usd)+delta(V.dedup_usd,pV.dedup_usd));
 card('cTvl','Pooled TVL', U(T.covered_usd)+delta(T.covered_usd,pT.covered_usd));
-card('cFee','Platform Fees / wk', U(F.total_usd)+delta(F.total_usd,pF.total_usd));
+card('cFee','LP Fees / wk', U(F.total_usd)+delta(F.total_usd,pF.total_usd));
 
 /* ===== chart helpers (hand-rolled inline SVG; offline-portable, no external lib) ===== */
 const CW=720, CH=170, PL=48, PR=14, PT=12, PB=20, IW=CW-PL-PR, IH=CH-PT-PB;
@@ -376,14 +390,22 @@ function barRank(items,lkey,vkey,color,n){
   }).join('');
 }
 
+// FX protocols being onboarded into the dataset — shown greyed under the leaderboards so Cuy
+// sees what's coming, not yet measured.
+const INWORK=['StableFX','OpenFX','Codex','Mento','Ratio'];
+function inWorkRows(){
+  return '<div class="iwsep"></div>'+INWORK.map(p=>
+    '<div class="brow inwork"><div class="bl">'+esc(p)+'</div>'+
+    '<div class="bt"></div><div class="bv"><span class="iw">IN WORK</span></div></div>').join('');
+}
+
 /* ===== TREND CHARTS (real 90d backfill, anchored to the snapshot) ===== */
 const HM=H.meta||{}, GRAN=HM.granularity||'weekly';
 const ymd=d=>d?d.slice(2,7):'';                         // YYYY-MM-DD -> YY-MM
 const rng=rows=>{ if(!rows||!rows.length) return GRAN; const ds=rows.map(r=>r.date).slice().sort();
   return GRAN+' · '+ymd(ds[0])+' → '+ymd(ds[ds.length-1]); };
 panel('pSupTrend','col8','Non-USD Stablecoin Supply · by currency', rng(H.supply_by_currency),
-  stackedArea('chSup',H.supply_by_currency||[],'currency','circ_usd',6)+
-  '<div class="cnote">Sources: Allium · Dune · DeFiLlama.</div>');
+  stackedArea('chSup',H.supply_by_currency||[],'currency','circ_usd',6));
 (function(){
   const rows=SU.by_currency.slice(0,10);
   let html='';
@@ -395,15 +417,13 @@ panel('pSupTrend','col8','Non-USD Stablecoin Supply · by currency', rng(H.suppl
   panel('pSup','col4','Current Supply','',html);
 })();
 panel('pVolTrend','col6','Onchain FX Volume · weekly', rng(H.volume_total),
-  areaChart('chVol',H.volume_total||[],'dedup_usd',CORE,'FX volume')+
-  '<div class="cnote">Cross-currency stablecoin swap volume per week, within-tx deduped (round-trips netted). Trailing partial week excluded.</div>');
-panel('pFeeTrend','col6','Platform Fees Earned · weekly', rng(H.fees_daily),
+  areaChart('chVol',H.volume_total||[],'dedup_usd',CORE,'FX volume'));
+panel('pFeeTrend','col6','LP Fees Earned · weekly', rng(H.fees_daily),
   areaChart('chFee',H.fees_daily||[],'fee_usd',FRNT,'Fees'));
 panel('pProtoVol','col6','Protocols · by FX Volume','7d',
-  barRank(S.leaderboard||[],'project','volume_usd',CORE,7)+
-  '<div class="cnote">Cross-currency volume routed through each DEX over the trailing week.</div>');
+  barRank(S.leaderboard||[],'project','volume_usd',CORE,7)+inWorkRows());
 panel('pProtoTvl','col6','Protocols · by Pooled TVL','current',
-  barRank(S.leaderboard||[],'project','tvl_usd',FRNT,7));
+  barRank(S.leaderboard||[],'project','tvl_usd',FRNT,7)+inWorkRows());
 
 /* ===== DISLOCATION ===== */
 (function(){
@@ -422,8 +442,6 @@ panel('pProtoTvl','col6','Protocols · by Pooled TVL','current',
     });
     html+='</div></div>';
   });
-  html+='<div class="note" style="border:none;padding-top:4px">Median realized cost / fill (fee+impact+depeg) vs mid. Onchain execution only — not the TradFi FX basis. ⚑ thin sample.</div>';
-  // recolor fill bars to band color
   panel('pDis','col5','Execution Cost by Size','THE OPPORTUNITY',html);
 })();
 
@@ -449,15 +467,25 @@ panel('pProtoTvl','col6','Protocols · by Pooled TVL','current',
       '<td>'+(r.tvl_usd>0?U(r.tvl_usd):'<span style="color:var(--faint)">n/a</span>')+'</td>'+
       '<td>'+U(r.fees_usd)+'</td><td>'+apr+(r.tvl_partial?' <span class="tag par">P</span>':'')+'</td></tr>';
   });
-  html+='</tbody></table><div class="note" style="padding-top:8px">'+
-    '<span class="tag par">P</span> TVL partial (singleton / non-EVM pools have no recoverable per-pool TVL); APR understated there. Fees '+PC(F.estimated_usd/F.total_usd)+' estimated-tier.</div>';
+  html+='</tbody></table>';
   panel('pLead','col7','Venues · Leaderboard','',html);
+})();
+
+/* ===== MARKET MAKER NOTES ===== */
+(function(){
+  const paths=[
+    ['1 · Passive LP','Earn pool fee APR (venue leaderboard). Cost: adverse selection, the pool quotes a stale price while real FX moves, so arb flow extracts from LPs. Baseline strategy, not edge.'],
+    ['2 · Prop quoting','Quote inside the AMM off a live FX feed, capture the execution-cost gap (size panel), hedge net inventory offchain. Single-MM corridors above show incumbents already running this.'],
+    ['3 · Staleness premium','Pools trade 24/7; offchain hedges close on weekends and off-fix hours. Widen quotes when unhedgeable and earn the risk premium fixed-fee AMM LPs give away.'],
+  ];
+  panel('pMM','col12','Market Maker Notes','revenue paths',
+    paths.map(p=>'<div class="mmrow"><div class="k">'+p[0]+'</div><div class="t">'+p[1]+'</div></div>').join(''));
 })();
 
 /* ---------- footer ---------- */
 document.getElementById('foot').innerHTML=
   'READ-ONLY MARKET STRUCTURE · NO CAPITAL · NO ON-CHAIN ACTIONS<br>'+
-  'SOURCES: Allium (supply_beta · dex.trades_evm · dex.pools · erc20_balances_latest) · '+
+  'SOURCES: Allium · Dune · DeFiLlama · '+
   'Generated '+S.meta.generated_at.slice(0,19).replace('T',' ')+'Z · DQ gate GREEN before publish<br>'+
   'v1 caveats: TVL/fees partial on non-EVM chains · single-MM concentration screen (top-1 sender ≥80%) · FX-gap-by-size + external reference = v1.5';
 
