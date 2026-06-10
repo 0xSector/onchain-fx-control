@@ -416,10 +416,21 @@ panel('pSupTrend','col8','Non-USD Stablecoin Supply · by currency', rng(H.suppl
   });
   panel('pSup','col4','Current Supply','',html);
 })();
-panel('pVolTrend','col6','Onchain FX Volume · weekly', rng(H.volume_total),
-  areaChart('chVol',H.volume_total||[],'dedup_usd',CORE,'FX volume'));
-panel('pFeeTrend','col6','LP Fees Earned · weekly', rng(H.fees_daily),
-  areaChart('chFee',H.fees_daily||[],'fee_usd',FRNT,'Fees'));
+/* per-currency attribution: drop the usd leg (history credits BOTH sides of each corridor,
+   so raw rows sum to 2x the netted total; non-USD crosses still credit both legs) */
+const volCcy=(H.volume_by_currency||[]).filter(r=>r.currency!=='usd');
+panel('pVolTrend','col6','Onchain FX Volume · by currency', rng(H.volume_total),
+  stackedArea('chVol',volCcy,'currency','dedup_usd',6)+
+  '<div class="cnote">Weekly dedup volume attributed to the non-USD side of each corridor. Non-USD crosses (e.g. eur/gbp) credit both legs, so the stack runs slightly above the netted total (mean +0.5%).</div>');
+(function(){
+  const fees={}; (H.fees_daily||[]).forEach(r=>fees[r.date]=+r.fee_usd||0);
+  const wk={}; volCcy.forEach(r=>wk[r.date]=(wk[r.date]||0)+(+r.dedup_usd||0));
+  const rows=volCcy.filter(r=>wk[r.date]>0&&fees[r.date]!=null)
+    .map(r=>({date:r.date,currency:r.currency,fee_usd:fees[r.date]*(+r.dedup_usd||0)/wk[r.date]}));
+  panel('pFeeTrend','col6','LP Fees Earned · by currency', rng(H.fees_daily),
+    stackedArea('chFee',rows,'currency','fee_usd',6)+
+    '<div class="cnote">Derived: weekly fee total (blended effective rate × gross volume) split pro-rata by currency volume share. Trend proxy, not a per-pool fee measurement.</div>');
+})();
 panel('pProtoVol','col6','Protocols · by FX Volume','7d',
   barRank(S.leaderboard||[],'project','volume_usd',CORE,7)+inWorkRows());
 panel('pProtoTvl','col6','Protocols · by Pooled TVL','current',
@@ -442,7 +453,7 @@ panel('pProtoTvl','col6','Protocols · by Pooled TVL','current',
     });
     html+='</div></div>';
   });
-  panel('pDis','col5','Execution Cost by Size','THE OPPORTUNITY',html);
+  panel('pDis','col5','All-in cost to execute onchain, by trade size','THE OPPORTUNITY',html);
 })();
 
 /* ===== CORRIDOR FLOW ===== */
