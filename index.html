@@ -267,7 +267,7 @@ function card(id,lab,big){
 card('cSup','Non-USD Stablecoin Supply', U(SU.total_usd)+delta(SU.total_usd,pSU.total_usd));
 card('cVol','Onchain FX Volume / wk', U(V.dedup_usd)+delta(V.dedup_usd,pV.dedup_usd));
 card('cTvl','Pooled TVL', U(T.covered_usd)+delta(T.covered_usd,pT.covered_usd));
-card('cFee','Trading Fees / wk', U(F.total_usd)+delta(F.total_usd,pF.total_usd));
+card('cFee','Platform Fees / wk', U(F.total_usd)+delta(F.total_usd,pF.total_usd));
 
 /* ===== chart helpers (hand-rolled inline SVG; offline-portable, no external lib) ===== */
 const CW=720, CH=170, PL=48, PR=14, PT=12, PB=20, IW=CW-PL-PR, IH=CH-PT-PB;
@@ -397,14 +397,13 @@ panel('pSupTrend','col8','Non-USD Stablecoin Supply · by currency', rng(H.suppl
 panel('pVolTrend','col6','Onchain FX Volume · weekly', rng(H.volume_total),
   areaChart('chVol',H.volume_total||[],'dedup_usd',CORE,'FX volume')+
   '<div class="cnote">Cross-currency stablecoin swap volume per week, within-tx deduped (round-trips netted). Trailing partial week excluded.</div>');
-panel('pFeeTrend','col6','Trading Fees Earned · weekly', rng(H.fees_daily),
+panel('pFeeTrend','col6','Platform Fees Earned · weekly', rng(H.fees_daily),
   areaChart('chFee',H.fees_daily||[],'fee_usd',FRNT,'Fees'));
 panel('pProtoVol','col6','Protocols · by FX Volume','7d',
   barRank(S.leaderboard||[],'project','volume_usd',CORE,7)+
   '<div class="cnote">Cross-currency volume routed through each DEX over the trailing week.</div>');
 panel('pProtoTvl','col6','Protocols · by Pooled TVL','current',
-  barRank(S.leaderboard||[],'project','tvl_usd',FRNT,7)+
-  '<div class="cnote">TVL-covered DEXes only; singleton / non-EVM pools have no recoverable per-pool TVL.</div>');
+  barRank(S.leaderboard||[],'project','tvl_usd',FRNT,7));
 
 /* ===== DISLOCATION ===== */
 (function(){
