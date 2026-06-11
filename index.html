@@ -485,7 +485,7 @@ panel('pProtoTvl','col6','Protocols · by Pooled TVL','current',
 (function(){
   const rows=S.leaderboard.slice(0,8);
   let html='<table><thead><tr><th>Venue</th><th>Volume</th><th>TVL</th><th>Fees/wk</th><th>Fee APR</th></tr></thead><tbody>';
-  rows.forEach(r=>{ const apr=r.fee_apr?Math.round(r.fee_apr*100)+'%':'–';
+  rows.forEach(r=>{ const apr=r.fee_apr?(r.fee_apr<0.01?(r.fee_apr*100).toFixed(1):Math.round(r.fee_apr*100))+'%':'–';
     html+='<tr><td>'+esc(r.project)+'</td><td>'+U(r.volume_usd)+'</td>'+
       '<td>'+(r.tvl_usd>0?U(r.tvl_usd):'<span style="color:var(--faint)">n/a</span>')+'</td>'+
       '<td>'+U(r.fees_usd)+'</td><td>'+apr+(r.tvl_partial?' <span class="tag par">P</span>':'')+'</td></tr>';
