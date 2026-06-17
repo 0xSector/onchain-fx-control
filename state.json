@@ -1,0 +1,85 @@
+{
+  "inception_ts": 1781720733,
+  "book_usd": 10000.0,
+  "corridor": "eur/usd",
+  "position": {
+    "pool": "aero_e846",
+    "deposit_usd": 10000.0,
+    "half_range": 0.03,
+    "p_a": 1.1208308412422212,
+    "p_b": 1.1901605839994722,
+    "L_norm": 312333.8661759245,
+    "x0": 4262.715916685983,
+    "y0": 5074.450034148705,
+    "entry_mid": 1.1554957126208467,
+    "entry_ts": 1781720733,
+    "last_ts": 1781720733,
+    "fees_usd": 0.0,
+    "lvr_usd": 0.0,
+    "gas_usd": 0.0,
+    "fees_since_recenter": 0.0,
+    "n_recenters": 0,
+    "ticks_in_range": 0,
+    "n_ticks": 0
+  },
+  "inception": {
+    "x0": 4262.715916685983,
+    "y0": 5074.450034148705,
+    "mid": 1.1554957126208467
+  },
+  "cursors": {
+    "aero_e846": 47465693,
+    "aero_f39b": 47465693
+  },
+  "vol_ewma": {
+    "aero_e846": {
+      "rate_yr": 1731600000.0,
+      "n": 0
+    },
+    "aero_f39b": {
+      "rate_yr": 1736800000.0,
+      "n": 0
+    }
+  },
+  "L_ewma": {
+    "aero_e846": {
+      "L": 123702909841896.0,
+      "n": 1
+    },
+    "aero_f39b": {
+      "L": 178462653328665.0,
+      "n": 1
+    }
+  },
+  "sigma": {
+    "prior": 0.071,
+    "n": 0,
+    "sum_r2": 0.0,
+    "sum_dt": 0.0,
+    "last_mid": 1.1554957126208467,
+    "last_ts": 1781720733
+  },
+  "basis_hist": [
+    -1.4979209532373083
+  ],
+  "nav_hist": [
+    {
+      "ts": 1781720733,
+      "nav": 10000.0,
+      "hodl": 10000.0,
+      "aave": 10000.0,
+      "mid": 1.1554957126208467,
+      "breaker": "OK"
+    }
+  ],
+  "n_reallocations": 0,
+  "n_ticks": 1,
+  "breaker": {
+    "state": "OK",
+    "reason": "fresh; spot~FV",
+    "dev_bps": -1.4979209532373083,
+    "thresh_bps": 25.0,
+    "since": 1781720733
+  },
+  "last_tick_ts": 1781720733
+}

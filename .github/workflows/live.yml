@@ -1,0 +1,53 @@
+# @purpose live.yml — the always-on host for the Onchain FX live paper LP (forward-press tool).
+#   Every 15 min: run one live_lp.py tick (poll the public Base RPC + Pyth, advance the paper LP, scan,
+#   recenter, render live.html), then commit live.html + state.json + live_ledger.jsonl back to the repo —
+#   GitHub Pages serves the updated watch UI at the "Live LP" tab. Public repo ⇒ unlimited Actions minutes.
+#
+#   No secrets (both feeds are public). No pip installs (the tool is pure stdlib — economics vendored in
+#   live_econ.py, Pyth/RPC via urllib). Best-effort cron (delays + 60-day inactivity auto-disable): the
+#   self-healing block cursor widens a delayed tick's window instead of dropping volume, and the UI ages a
+#   liveness lamp. PAPER ONLY — NAV is notional, no capital, no on-chain actions.
+
+name: live-lp
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"      # every 15 min; disable the schedule to pause the press
+  workflow_dispatch: {}          # manual single tick
+
+permissions:
+  contents: write
+
+concurrency:
+  group: live-lp
+  cancel-in-progress: true       # never let two ticks race on the same state
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # stdlib only — no `pip install`
+
+      - name: Run one live tick → render live.html
+        env:
+          ONCHAIN_FX_LIVE_DIR: ${{ github.workspace }}   # state + ledger + UI at the repo root
+          ONCHAIN_FX_LIVE_OUT: live.html                 # publish the watch UI at the Live LP tab
+        run: python live_lp.py tick
+
+      - name: Commit state + watch UI
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f live.html state.json live_ledger.jsonl
+          if git diff --cached --quiet; then
+            echo "no change this tick"; exit 0
+          fi
+          git commit -m "live tick $(date -u +%FT%TZ)"
+          # retry-push in case a Pages build or a near-simultaneous run moved HEAD
+          for i in 1 2 3; do
+            git push && break || { git pull --rebase --autostash && sleep 3; }
+          done

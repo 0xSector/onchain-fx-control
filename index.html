@@ -206,8 +206,8 @@ tr:hover td{background:oklch(0.24 0.014 146 / .6)}
 .foot{max-width:1320px; margin:16px auto 0; padding:13px 18px; font-family:var(--mono);
   font-size:10px; color:var(--faint); letter-spacing:.04em; line-height:1.7; border-top:1px solid var(--edge)}
 @media(prefers-reduced-motion:reduce){.panel{opacity:1;transform:none}.lamp.blink{animation:none}}
-</style></head>
-<body>
+</style><style>.xnav{display:flex;gap:4px;max-width:1320px;margin:0 auto;padding:12px 18px 0}.xnav a{font-family:var(--mono);font-size:12px;letter-spacing:.04em;text-decoration:none;color:var(--dim);padding:7px 15px;border:1px solid var(--edge);border-bottom:none;border-radius:6px 6px 0 0;background:var(--panel2)}.xnav a:hover{color:var(--ink)}.xnav a.on{color:var(--frontier);background:var(--bg);border-color:var(--edge2)}</style></head>
+<body><nav class="xnav"><a class="on" href="index.html">Market Structure</a><a href="live.html">Live LP ●</a></nav>
 <header class="bus">
   <div class="bus-id">
     <h1>Onchain <span style="color:var(--frontier)">FX</span></h1>
@@ -402,8 +402,8 @@ function barRank(items,lkey,vkey,color,n){
   }).join('');
 }
 
-// FX protocols being onboarded into the dataset — shown greyed under the leaderboards so Cuy
-// sees what's coming, not yet measured.
+// FX protocols being onboarded into the dataset — shown greyed under the leaderboards to
+// signal what's coming, not yet measured.
 const INWORK=['StableFX','OpenFX','Codex','Mento','Ratio'];
 function inWorkRows(){
   return '<div class="iwsep"></div>'+INWORK.map(p=>
