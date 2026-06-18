@@ -39,12 +39,21 @@ Q96 = 2 ** 96
 TWAP_S = 300                       # 5-min TWAP window for the robust mark (review F1)
 GETLOGS_CHUNK = 5_000              # max block span per eth_getLogs (public-RPC friendly); chunked if gap larger
 
-# label -> (address, fee_bps, dec0, dec1). The clean slot0 mid set from S2 (Aerodrome Slipstream / Uni v3,
-# token0=EURC). Tessera excluded upstream (prop-AMM, null token0/1, no v3 mid).
+# label -> (address, fee_bps, dec0, dec1). All token0=EUR-stable(6) / token1=USD-stable(6), so
+# mid = (sqrtPriceX96/2^96)^2 = USD per EUR (10^(dec0-dec1)=1). Verified live 2026-06-17 via token0/token1/
+# fee/decimals introspection. The 3 Aerodrome tiers are the deep, screen-passing set (S2 clean mids); the
+# rest are THIN Base EUR pools added for visibility only (all <$300k TVL -> watch-not-allocate in live_lp).
+# Tessera / Uniswap-v4 / Curve / Balancer / Aerodrome-v2 EUR pools are NOT here (no readable v3 slot0 mid).
 POOLS = {
-    "aero_e846": ("0xe846373c1a92b167b4e9cd5d8e4d6b1db9e90ec7", 5,  6, 6),   # deepest TVL ($2.87M), canonical mid
-    "aero_f39b": ("0xf39b7c34be147f5dc1bc374f27af2e9f03ad3113", 1,  6, 6),   # 1bp tier, highest volume
-    "aero_c5e5": ("0xc5e51044eb7318950b1afb044fccfb25782c48c1", 30, 6, 6),   # 30bp tier
+    "aero_e846":    ("0xe846373c1a92b167b4e9cd5d8e4d6b1db9e90ec7", 5,  6, 6),  # deepest TVL ($2.87M), canonical mid
+    "aero_f39b":    ("0xf39b7c34be147f5dc1bc374f27af2e9f03ad3113", 1,  6, 6),  # 1bp tier, highest volume
+    "aero_c5e5":    ("0xc5e51044eb7318950b1afb044fccfb25782c48c1", 30, 6, 6),  # 30bp tier ($219k TVL)
+    "pancake_1ca4": ("0x1ca42c7219f0cb1b67927e26502320cb98f725bd", 1,  6, 6),  # PancakeSwap v3, EURC/USDC, $190k
+    "aero_183c":    ("0x183cefd0928ea4d54c9d726dd975fab561705c86", 5,  6, 6),  # Aerodrome, EURAU/USDC (diff EUR issuer)
+    "alien_7b2c":   ("0x7b2c99188d8ec7b82d6b3b3b1c1002095f1b8498", 1,  6, 6),  # AlienBase v3, EURC/USDC, $112k
+    "uni_7279":     ("0x7279c08a36333e12c3fc81747963264c100d66fb", 5,  6, 6),  # Uniswap v3, EURC/USDC, $94k
+    "pancake_f0c5": ("0xf0c559af52bce48b3f3710604a59b4feaefd5555", 1,  6, 6),  # PancakeSwap v3, EURC/USDT (diff USD stable)
+    "uni_03d8":     ("0x03d8219070e54a55a9ce60889ead2ffd18eb6aa9", 30, 6, 6),  # Uniswap v3, EURC/USDC, $12k (dust)
 }
 
 # function selectors
@@ -175,12 +184,14 @@ def poll_pool(label: str, from_block: int | None, to_block: int) -> dict:
     try:
         obs["mark_mid"] = twap_mid(label)
     except Exception as e:
-        obs["ok"] = False
+        # no observe() oracle (some thin pools lack one) -> mark on spot. NOT a failure: ok stays True,
+        # flagged mark_is_spot. Only a missing spot too is a real failure (set below).
         obs["errors"].append(f"twap:{e}")
-        try:                                    # degrade mark to spot rather than lose the tick entirely
+        try:
             obs["mark_mid"] = spot_mid(label)
             obs["mark_is_spot"] = True
         except Exception as e2:
+            obs["ok"] = False
             obs["errors"].append(f"spot_fallback:{e2}")
     try:
         obs["spot_mid"] = spot_mid(label)

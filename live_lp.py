@@ -57,16 +57,25 @@ L_HALFLIFE_S = 3600.0               # EWMA half-life for in-range liquidity() �
 #   noisy (a 30bp pool's active-tick L swings ~30x as concentrated positions cross the tick). The correct
 #   denominator for interval fee attribution is the dwell-time-weighted AVERAGE in-range L, so we smooth it.
 # snapshot weekly-volume priors (m2_pool_volume_7d, 2026-06-10) that seed the EWMA on first sight
-VOL_PRIOR_WK = {"aero_e846": 33.3e6, "aero_f39b": 33.4e6, "aero_c5e5": 23.6e6}
+VOL_PRIOR_WK = {"aero_e846": 33.3e6, "aero_f39b": 33.4e6, "aero_c5e5": 23.6e6,
+                "pancake_1ca4": 3.81e6, "aero_183c": 139_269.0, "alien_7b2c": 486_125.0,
+                "uni_7279": 636_276.0, "pancake_f0c5": 1.435e6, "uni_03d8": 3_549.0}
 # snapshot per-pool TVL (m3_tvl_by_pool_7d, 2026-06-10) for the investability screen + fee-share cap.
-POOL_TVL = {"aero_e846": 2_865_536.0, "aero_f39b": 591_996.0, "aero_c5e5": 219_423.0}
+POOL_TVL = {"aero_e846": 2_865_536.0, "aero_f39b": 591_996.0, "aero_c5e5": 219_423.0,
+            "pancake_1ca4": 189_867.0, "aero_183c": 140_511.0, "alien_7b2c": 112_294.0,
+            "uni_7279": 93_723.0, "pancake_f0c5": 43_429.0, "uni_03d8": 11_955.0}
 
-# INVESTABILITY SCREEN (book.MIN_TVL/MIN_VOL_WK): the scanner ranks only pools deep enough to be a real
-# LP venue. This DROPS aero_c5e5 ($219k TVL < $300k floor): its ~$29M/wk over $219k TVL is wash/arb churn
-# (implied >2000% pool yield), NOT organic fee flow a $10k LP can safely earn — exactly the thin-pool false
-# signal the screen exists to reject. Candidate-set refresh is the weekly snapshot's job (plan), not per-tick.
-CANDIDATES = [l for l in live_mid.POOLS
-              if POOL_TVL.get(l, 0) >= MIN_TVL and VOL_PRIOR_WK.get(l, 0) >= MIN_VOL_WK]
+# WATCH set = all 3 Aerodrome EUR/USDC tiers (the clean slot0/observe-readable Base EUR pools). Every tick
+# polls and RANKS all of them so they're visible in the UI. (The other 16 Base EUR pools are thin: the
+# Uniswap ones are <$100k TVL, and Tessera's $23.5M/wk is a prop-AMM with no v3 mid — excluded by design.)
+CANDIDATES = list(live_mid.POOLS)
+# ALLOCATION screen (book.MIN_TVL/MIN_VOL_WK): the book may only be deployed into pools deep enough to be a
+# real LP venue. This keeps aero_c5e5 ($219k TVL < $300k floor) WATCHED but allocation-INELIGIBLE — its
+# ~$29M/wk over $219k TVL is wash/arb churn (implied >1000% pool yield), NOT fee flow a $10k LP can earn;
+# allocating the book there would capture NAV on a garbage number. To make it allocatable, add it to
+# ELIGIBLE (or lower MIN_TVL). Candidate-set refresh is the weekly snapshot's job (plan), not per-tick.
+ELIGIBLE = [l for l in CANDIDATES
+            if POOL_TVL.get(l, 0) >= MIN_TVL and VOL_PRIOR_WK.get(l, 0) >= MIN_VOL_WK]
 MID_POOL = "aero_e846"              # canonical deepest-TVL pool for the breaker spot reference
 
 # autonomous-action policy
@@ -339,12 +348,15 @@ def scan(state: dict, feed: dict, sig_val: float, held: str) -> dict:
             continue
         m = modeled_net_apr(usd, o["mark_mid"], o["fee_bps"], vol_yr_for(state, lbl),
                             L_active_for(state, lbl, o["L_active"]), sig_val, POOL_TVL.get(lbl, 0.0))
-        rank.append({"pool": lbl, "fee_bps": o["fee_bps"], **m})
+        rank.append({"pool": lbl, "fee_bps": o["fee_bps"], "eligible": lbl in ELIGIBLE, **m})
     rank.sort(key=lambda r: r["net_apr"], reverse=True)
-    decision = {"ranking": rank, "best": rank[0]["pool"] if rank else None, "reallocate": False}
-    if not rank:
+    # the book is only allocated among ELIGIBLE pools; ineligible (screened) pools are ranked for VISIBILITY
+    # but never become `best`, so the scanner can't reallocate the paper book into a wash-inflated thin pool.
+    elig = [r for r in rank if r["eligible"]]
+    decision = {"ranking": rank, "best": elig[0]["pool"] if elig else None, "reallocate": False}
+    if not elig:
         return decision
-    best = rank[0]
+    best = elig[0]
     net_now = next((r["net_apr"] for r in rank if r["pool"] == held), None)
     decision["net_now"] = net_now
     decision["net_best"] = best["net_apr"]

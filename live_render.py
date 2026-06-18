@@ -209,12 +209,19 @@ def render(state: dict, last_row: dict) -> None:
     if last_rank:
         for r in last_rank:
             held = pos and r["pool"] == pos["pool"]
-            rank_rows += (f'<tr{" class=held" if held else ""}><td>{r["pool"]}{" ◂ held" if held else ""}</td>'
+            inelig = not r.get("eligible", True)
+            # screened (thin-TVL) pools are watched for visibility but never allocated — flag them, and
+            # cap the displayed APR so a wash-inflated >100% gross reads as a warning, not an opportunity.
+            def _apr(x):
+                return ">+100%" if x > 1.0 else ("<-100%" if x < -1.0 else f"{x*100:+.1f}%")
+            tag = ' <span class="flag">⚑ screened · thin TVL</span>' if inelig else (" ◂ held" if held else "")
+            cls = "held" if held else ("inelig" if inelig else "")
+            rank_rows += (f'<tr{(" class="+cls) if cls else ""}><td>{r["pool"]}{tag}</td>'
                           f'<td class="num">{r["fee_bps"]:.0f}bp</td>'
                           f'<td class="num">{r["fee_share"]*100:.4f}%</td>'
-                          f'<td class="num">{r["gross_apr"]*100:+.1f}%</td>'
+                          f'<td class="num">{_apr(r["gross_apr"])}</td>'
                           f'<td class="num">{r["lvr_apr"]*100:.1f}%</td>'
-                          f'<td class="num {"good" if r["net_apr"]>=0 else "bad"}">{r["net_apr"]*100:+.1f}%</td></tr>')
+                          f'<td class="num {"" if inelig else ("good" if r["net_apr"]>=0 else "bad")}">{_apr(r["net_apr"])}</td></tr>')
 
     # DQ lamps
     dev = last_row.get("dev_bps")
@@ -284,6 +291,8 @@ th{{text-align:left;padding:6px 8px;color:var(--faint);font-family:var(--mono);f
 letter-spacing:.07em;text-transform:uppercase;border-bottom:1px solid var(--edge)}}
 td{{padding:6px 8px;border-bottom:1px solid #2a2e32;color:var(--dim)}}
 tr.held td{{color:var(--ink)}} tr.held{{background:rgba(216,184,106,.06)}}
+tr.inelig td{{color:var(--faint)}} tr.inelig{{opacity:.72}}
+.flag{{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;color:var(--amber);border:1px solid var(--amber);border-radius:3px;padding:0 4px;margin-left:5px;white-space:nowrap}}
 .good{{color:var(--green)}} .bad{{color:var(--red)}}
 .dec{{background:var(--panel);border:1px solid var(--edge);border-radius:7px;padding:4px 14px;max-height:340px;overflow-y:auto}}
 .dec td{{font-size:12.5px;vertical-align:top}}
@@ -329,7 +338,7 @@ padding:7px 15px;border:1px solid var(--edge);border-bottom:none;border-radius:6
   <div>
     <h2>Scanner — net-APR ranking (this tick)</h2>
     <table><tr><th>pool</th><th>tier</th><th>L-share</th><th>gross</th><th>LVR</th><th>net APR</th></tr>{rank_rows or '<tr><td colspan=6 class=empty>—</td></tr>'}</table>
-    <div class="meta" style="margin-top:8px">Ranks on <b>NET</b> (gross fee − parametric LVR), fee_share in v3 L-units (F2). Reallocates only past the switch-cost hurdle (payback ≤30d + 50bp hysteresis). Mostly declines at $10k — the edge is structural.</div>
+    <div class="meta" style="margin-top:8px">Ranks on <b>NET</b> (gross fee − parametric LVR), fee_share in v3 L-units (F2). Reallocates only past the switch-cost hurdle (payback ≤30d + 50bp hysteresis). Mostly declines at $10k — the edge is structural. <b>⚑ screened</b> pools (TVL &lt; $300k) are <b>watched but not allocated</b> — their volume/TVL implies a wash-inflated APR a $10k LP can't actually earn.</div>
   </div>
 </div>
 
