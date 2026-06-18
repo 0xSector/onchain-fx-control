@@ -37,6 +37,8 @@ import pyth
 # tool runs in the public repo with zero pip installs and no private-pipeline import. See live_econ.py.
 from live_econ import (cap_efficiency, lvr_apr, lp_amounts, lp_value, L_for_deposit, hodl_value,
                        REF_RANGE, BOOK_USD, MIN_TVL, MIN_VOL_WK, SEC_Y, AAVE_USDC_APR)
+# Delta-hedge overlay reuses the self-tested EUR-delta math VERBATIM (delta_hedge.py is unchanged).
+from delta_hedge import eur_delta_usd, v3_amounts, REHEDGE_COST_1PCT
 
 ROOT = Path(__file__).resolve().parent
 # Output dir is configurable so the SAME code runs both in the private repo (default artifacts path) and
@@ -45,6 +47,7 @@ LIVE = Path(os.environ.get("ONCHAIN_FX_LIVE_DIR", ROOT / "artifacts" / "book" / 
 LIVE.mkdir(parents=True, exist_ok=True)
 STATE = LIVE / "state.json"
 LEDGER = LIVE / "live_ledger.jsonl"
+HEDGE_EVAL = LIVE / "hedge_eval.jsonl"   # onchain_fx_hedge_001: live naked-vs-hedged Sharpe/vol (upserted)
 
 # ---- model / policy constants ----------------------------------------------------------------
 CORRIDOR = "eur/usd"                # v1 launch scope: EUR/USDC on Base only (deepest, cleanest floor)
@@ -56,18 +59,23 @@ VOL_HALFLIFE_S = 6 * 3600.0         # EWMA half-life for the per-pool live volum
 L_HALFLIFE_S = 3600.0               # EWMA half-life for in-range liquidity() — a SINGLE block's L_active is
 #   noisy (a 30bp pool's active-tick L swings ~30x as concentrated positions cross the tick). The correct
 #   denominator for interval fee attribution is the dwell-time-weighted AVERAGE in-range L, so we smooth it.
-# snapshot weekly-volume priors (m2_pool_volume_7d, 2026-06-10) that seed the EWMA on first sight
+# snapshot weekly-volume priors (m2_pool_volume_7d, 2026-06-10) that seed the EWMA on first sight.
+# univ4_64db = Uniswap v4 EURC/USDC 5bp, measured ~$6.9k/28h on 2026-06-18 (probe_v4_pools.py) -> ~$42k/wk.
 VOL_PRIOR_WK = {"aero_e846": 33.3e6, "aero_f39b": 33.4e6, "aero_c5e5": 23.6e6,
                 "pancake_1ca4": 3.81e6, "aero_183c": 139_269.0, "alien_7b2c": 486_125.0,
-                "uni_7279": 636_276.0, "pancake_f0c5": 1.435e6, "uni_03d8": 3_549.0}
+                "uni_7279": 636_276.0, "pancake_f0c5": 1.435e6, "uni_03d8": 3_549.0,
+                "univ4_64db": 42_000.0}
 # snapshot per-pool TVL (m3_tvl_by_pool_7d, 2026-06-10) for the investability screen + fee-share cap.
+# univ4_64db has NO snapshot TVL (v4 singleton, excluded from the balance-sum m3); ~$9k is an active-L
+# proxy (its in-range L 3.42e11 vs aero_e846 1.06e14 at $2.87M TVL) — order-of-magnitude only, watch-only.
 POOL_TVL = {"aero_e846": 2_865_536.0, "aero_f39b": 591_996.0, "aero_c5e5": 219_423.0,
             "pancake_1ca4": 189_867.0, "aero_183c": 140_511.0, "alien_7b2c": 112_294.0,
-            "uni_7279": 93_723.0, "pancake_f0c5": 43_429.0, "uni_03d8": 11_955.0}
+            "uni_7279": 93_723.0, "pancake_f0c5": 43_429.0, "uni_03d8": 11_955.0,
+            "univ4_64db": 9_000.0}
 
-# WATCH set = all 3 Aerodrome EUR/USDC tiers (the clean slot0/observe-readable Base EUR pools). Every tick
-# polls and RANKS all of them so they're visible in the UI. (The other 16 Base EUR pools are thin: the
-# Uniswap ones are <$100k TVL, and Tessera's $23.5M/wk is a prop-AMM with no v3 mid — excluded by design.)
+# WATCH set = every readable Base EUR pool in live_mid.POOLS (9 v3-family + 1 Uniswap v4). Every tick polls
+# and RANKS all of them so they're visible in the UI; only the deep, screen-passing ones are ALLOCATABLE.
+# v4 (univ4_64db) is a singleton-poolId pool marked on spot (no oracle) and is thin -> watch-only by design.
 CANDIDATES = list(live_mid.POOLS)
 # ALLOCATION screen (book.MIN_TVL/MIN_VOL_WK): the book may only be deployed into pools deep enough to be a
 # real LP venue. This keeps aero_c5e5 ($219k TVL < $300k floor) WATCHED but allocation-INELIGIBLE — its
@@ -93,6 +101,30 @@ DISLOC_FLOOR_BPS = 25.0             # never flag tighter than this (EUR S2 max ~
 DISLOC_NSIGMA = 4.0                 # flag at median + N*sigma over the trailing basis
 STALE_TICK_MULT = 3.0               # a tick gap > this x the nominal cadence is a liveness concern (UI lamp)
 NOMINAL_CADENCE_S = 900             # D2: 15-min nominal tick
+
+# ---- delta-hedge overlay (delta_hedge_plan.html, 2026-06-18) ----------------------------------
+# The overlay runs as a SEPARATE parallel book (its own ONCHAIN_FX_LIVE_DIR), toggled by this flag, so the
+# original naked LP keeps running byte-identical. OFF (default) -> no hedge machinery touches the book at all
+# (naked book, original behaviour). ON -> the short overlay + nav_hedged + the hedge UI. Run two cron steps:
+# the naked book with the flag unset, and a hedged book with ONCHAIN_FX_HEDGE=1 + its own dir/out.
+HEDGE_ON = os.environ.get("ONCHAIN_FX_HEDGE", "0").strip().lower() not in ("0", "", "false", "no", "off")
+# A PAPER short-EUR leg sized to the LP's live $-delta (= the USD value of the EUR/EURC leg, x*p). The
+# concentrated LP is born ~49% long EUR; that delta is an UNCOMPENSATED directional bet whose P&L
+# dominates the book's variance. Shorting it isolates the fee-minus-LVR carry. This is a SHARPE improver,
+# NOT a yield improver (net APR ~flat): it removes DELTA, never LVR (gamma is unhedgeable onchain). The
+# overlay is ADDITIVE — nav/hodl/aave stay byte-identical; nav_hedged is a new line. Paper only, no venue.
+REHEDGE_BAND = 0.01          # re-size the short when |EUR move since last sizing| > 1% (D1; the validated
+#   delta_hedge.py band, "+/-1% EUR move", ~51 crossings/yr) — NOT a |residual|/book rule (see hedge_step).
+# Paper resize cost in bps on the (re)sized notional, calibrated so the LIVE per-resize charge matches the
+# OFFLINE delta_hedge.REHEDGE_COST_1PCT annual drag (D3): REHEDGE_COST_1PCT (0.0031/yr) = ~51 band
+# crossings/yr * ~$0.62/resize on $10k. Per-resize $0.62 on the ~$4,900 (=0.49*book) notional = 1.24bp.
+#   1.24bp = (REHEDGE_COST_1PCT * BOOK_USD / 51 crossings) / (0.49 * BOOK_USD) * 1e4.
+# NB: delta_hedge_plan D3 prints "12.4bp" — that is a 10x decimal slip (12.4bp*$4,900 = $6.07 != $0.62 and
+# would 10x-overcharge the hedge); 1.24bp is the value that makes live and offline agree, per D3's own rule.
+PERP_FEE_BPS = round(REHEDGE_COST_1PCT * BOOK_USD / 51.0 / (0.49 * BOOK_USD) * 1e4, 2)   # -> 1.24
+CARRY_RATE = float(os.environ.get("ONCHAIN_FX_HEDGE_CARRY", "0.0"))   # carry on the SHORT notional, annual.
+#   DEFAULT 0.0 (book carry at 0; any + carry is upside, re-underwrite each snapshot). ONCHAIN_FX_HEDGE_CARRY
+#   =0.0105 toggles the Ostium ~125bp-gap Jun-2026 scenario (flips the UI carry lamp amber). (D2)
 
 
 # ---- v3 raw-L fee share (F2) -----------------------------------------------------------------
@@ -200,6 +232,131 @@ def L_update(state: dict, label: str, L_live: float, dt_s: float) -> None:
     alpha = 1.0 - math.exp(-max(0, dt_s) / L_HALFLIFE_S) if dt_s > 0 else 0.0
     e["L"] = alpha * L_live + (1 - alpha) * e["L"]
     e["n"] += 1
+
+
+# ---- delta-hedge overlay: size / mark / resize -----------------------------------------------
+def _hedge_unrealized(h: dict, mid: float) -> float:
+    """Mark-to-market P&L of the CURRENT short leg since it was last (re)sized. A short GAINS as EUR
+    falls: pnl = notional * (entry_mid - mid) / entry_mid. Linear in mid -> cancels the LP's linear delta
+    EXACTLY at the sizing instant; the LP leg's convexity (gamma/LVR) is what survives as a drag."""
+    em = h.get("entry_mid")
+    if not em or em <= 0:
+        return 0.0
+    return h["notional_usd"] * (em - mid) / em
+
+
+def gamma_resid_usd(pos: dict, mid: float, band: float = REHEDGE_BAND) -> float:
+    """Diagnostic the UI must surface: the convexity drag the hedge CANNOT remove, over a reference -band
+    move. The short is linear, the LP leg convex, so gamma always survives (always < 0). PARAMETRIC from
+    current geometry, NOT a realized P&L: dV(-band) - notional * (-band)."""
+    L, p_a, p_b = pos["L_norm"], pos["p_a"], pos["p_b"]
+    notional = eur_delta_usd(L, mid, p_a, p_b)
+    midp = mid * (1 - band)
+    dV = lp_value(L, midp, p_a, p_b) - lp_value(L, mid, p_a, p_b)
+    return dV - notional * ((midp - mid) / mid)
+
+
+def hedge_sign_selftest(pos: dict, mid: float) -> None:
+    """Step-0 gate, WIRED (not a comment): on a synthetic -1% move the short must GAIN and shrink the
+    move's |P&L|; gamma_resid must be < 0 BOTH directions. Catches a sign flip before any sizing."""
+    L, p_a, p_b = pos["L_norm"], pos["p_a"], pos["p_b"]
+    notional = eur_delta_usd(L, mid, p_a, p_b)
+    for b in (-0.01, +0.01):
+        midp = mid * (1 + b)
+        dV = lp_value(L, midp, p_a, p_b) - lp_value(L, mid, p_a, p_b)
+        short_pnl = notional * (mid - midp) / mid
+        # gamma is <= 0 (the LP is short gamma). OUT OF RANGE (mid <= p_a, all EURC) V is LINEAR in mid so
+        # gamma_resid is exactly 0 and float rounding lands it at a tiny POSITIVE epsilon — so this is a
+        # tolerance check, not a strict <0 (a strict <0 spuriously faults the moment EUR drops below band).
+        assert gamma_resid_usd(pos, mid) <= 1e-6, "G9 gamma_resid positive (convexity mislabel)"
+        if b < 0:
+            assert short_pnl > 0, "G9 SIGN ERROR: short loses on EUR-down"
+            assert abs(dV + short_pnl) <= abs(dV), "G9 hedge did not reduce the move's |P&L|"
+
+
+def hedge_open(state: dict, pos: dict, mid: float, now_ts: int) -> dict:
+    """Size the paper short to the LP's live EUR $-delta at `mid` (residual = 0 at this instant). Charges
+    one PERP_FEE on the opened notional — you cannot put on a ~$4,900 short for free. Runs the sign gate
+    first, so a sign flip fails CLOSED before it can ever size a position."""
+    hedge_sign_selftest(pos, mid)
+    notional = eur_delta_usd(pos["L_norm"], mid, pos["p_a"], pos["p_b"])
+    fee = PERP_FEE_BPS / 1e4 * abs(notional)
+    return {"notional_usd": notional, "entry_mid": mid, "last_mid": mid, "last_ts": now_ts,
+            "realized_usd": 0.0, "pnl_usd": 0.0, "carry_usd": 0.0, "fees_usd": fee,
+            "n_rehedges": 0, "sized_at_ts": now_ts}
+
+
+def hedge_step(state: dict, pos: dict, mid: float, br_state: str, now_ts: int,
+               force_resize: bool) -> dict:
+    """Mark the short on the LP's OWN mid (single feed), accrue carry, and re-size on the +/-band rule.
+    Re-size ONLY when breaker == OK (D5); mark-only under FX_CLOSED / DISLOCATED. STALE never reaches here
+    (the whole tick freezes upstream). On a resize, the unrealized chunk LOCKS into realized_usd and
+    entry_mid resets, so pnl_usd is continuous across the move (no drop, no double-book)."""
+    h = state["hedge"]
+    book = state["book_usd"]
+    # carry on the short notional, accrued per dt on every marking tick (exactly 0 at CARRY_RATE = 0)
+    if h.get("last_ts"):
+        dt_y = max(0.0, (now_ts - h["last_ts"]) / SEC_Y)
+        h["carry_usd"] += CARRY_RATE * h["notional_usd"] * dt_y
+    h["last_ts"], h["last_mid"] = now_ts, mid
+
+    lp_delta = eur_delta_usd(pos["L_norm"], mid, pos["p_a"], pos["p_b"])
+    residual = lp_delta - h["notional_usd"]               # dollar delta gap carried since last sizing
+    # TRIGGER on the EUR MOVE since the last sizing, NOT on |residual|/book. The LP's gamma is huge
+    # (~$1,619 of delta per 1% EUR move = 16% of book), so a |residual|/book>1% rule would fire every
+    # ~0.06% move (~12,750 rehedges/yr) and the perp cost would dwarf the carry. delta_hedge.py defines
+    # REHEDGE_BAND as a "+/-1% EUR move" trigger and calibrates REHEDGE_COST_1PCT to ~51 crossings/yr on
+    # that basis (the PERP_FEE_BPS calibration above assumes it). delta_hedge_plan §02 phrases the trigger
+    # as |residual/book|>0.01 — that is inconsistent with the engine + the cost model; the EUR-move band is
+    # the validated, Sharpe-optimal design and is what keeps net APR ~flat. (Residual is still reported.)
+    eur_move = (mid / h["entry_mid"] - 1.0) if h.get("entry_mid") else 0.0
+    pnl_before = h["realized_usd"] + _hedge_unrealized(h, mid)
+    resized = False
+    if br_state == "OK" and (force_resize or abs(eur_move) > REHEDGE_BAND):
+        h["realized_usd"] += _hedge_unrealized(h, mid)     # lock the current chunk
+        h["entry_mid"] = mid                               # reset the entry -> unrealized now 0
+        h["notional_usd"] = lp_delta                       # re-neutralize to the live delta
+        h["fees_usd"] += PERP_FEE_BPS / 1e4 * abs(lp_delta)
+        h["n_rehedges"] += 1
+        h["sized_at_ts"] = now_ts
+        resized = True
+    h["pnl_usd"] = h["realized_usd"] + _hedge_unrealized(h, mid)   # total = realized + current unrealized
+    return {"resized": resized, "residual_before": residual, "lp_delta": lp_delta, "eur_move": eur_move,
+            "pnl_before": pnl_before, "pnl_after": h["pnl_usd"]}
+
+
+def assert_conservation(state: dict, pos: dict, mid: float, marks: dict, h_snapshot: dict | None,
+                        hres: dict | None, br_state: str) -> None:
+    """8 conservation identities (G1-G8, delta_hedge_plan.html §05) + a sign/convexity self-test (G9, the
+    §06 landmine-2 mitigation, wired as a gate). Raise on any breach so the caller REVERTS the overlay to
+    last-good rather than persist a corrupted hedge. The naked book (validated engine) is recomputed
+    independently here and must equal the marks (to 1e-9) regardless of the overlay."""
+    h, book, TOL = state["hedge"], state["book_usd"], 1e-9
+    # G1 nav_hedged - nav_naked == pnl + carry - fees, exactly (the ONLY delta between the two NAVs)
+    assert abs((marks["nav_hedged"] - marks["nav"]) - (h["pnl_usd"] + h["carry_usd"] - h["fees_usd"])) < TOL, "G1"
+    # G2 nav_naked / hodl / aave never reference the hedge (recompute from the validated formulas, compare)
+    nav_indep = lp_value(pos["L_norm"], mid, pos["p_a"], pos["p_b"]) + pos["fees_usd"] - pos["gas_usd"]
+    hodl_indep = hodl_value(state["inception"]["x0"], state["inception"]["y0"], mid)
+    aave_indep = state["book_usd"] * (1 + AAVE_USDC_APR * marks["yrs"])
+    assert (abs(marks["nav"] - nav_indep) < TOL and abs(marks["hodl"] - hodl_indep) < TOL
+            and abs(marks["aave"] - aave_indep) < TOL), "G2"
+    # G3 book principal never moves
+    assert state["book_usd"] == BOOK_USD, "G3"
+    # G4 single feed: the short marks on the SAME mid as V
+    assert h["last_mid"] == mid, "G4"
+    # G5 residual == 0 immediately after a (re)size
+    if hres and hres.get("resized"):
+        assert abs(hres["lp_delta"] - h["notional_usd"]) < 1e-6 * book, "G5"
+        # G6 resize lock: pnl continuous across the move (no drop / no double-book)
+        assert abs(hres["pnl_before"] - hres["pnl_after"]) < 1e-6, "G6"
+    # G7 n_rehedges constant on a non-OK (mark-only) tick
+    if br_state != "OK" and h_snapshot is not None:
+        assert h["n_rehedges"] == h_snapshot["n_rehedges"], "G7"
+    # G8 carry exactly 0 when CARRY_RATE == 0
+    if CARRY_RATE == 0.0:
+        assert h["carry_usd"] == 0.0, "G8"
+    # G9 sign + convexity still hold at the live mid
+    hedge_sign_selftest(pos, mid)
 
 
 # ---- state -----------------------------------------------------------------------------------
@@ -409,13 +566,94 @@ def nav_marks(state: dict, pos: dict, mid: float, now_ts: int) -> dict:
     the LP mark vs HODL). Parametric LVR is a SEPARATE diagnostic, never subtracted from NAV (would
     double-count the realized IL)."""
     V = lp_value(pos["L_norm"], mid, pos["p_a"], pos["p_b"])
-    nav = V + pos["fees_usd"] - pos["gas_usd"]
+    nav = V + pos["fees_usd"] - pos["gas_usd"]                          # nav_naked — UNCHANGED by the overlay
     inc = state["inception"]
     hodl = hodl_value(inc["x0"], inc["y0"], mid)                       # IL peer: inception basket marked now
     yrs = (now_ts - state["inception_ts"]) / SEC_Y
     aave = state["book_usd"] * (1 + AAVE_USDC_APR * yrs)
-    return {"nav": nav, "V": V, "hodl": hodl, "aave": aave, "lvr_diag": pos["lvr_usd"],
-            "fees": pos["fees_usd"], "gas": pos["gas_usd"], "yrs": yrs}
+    out = {"nav": nav, "V": V, "hodl": hodl, "aave": aave, "lvr_diag": pos["lvr_usd"],
+           "fees": pos["fees_usd"], "gas": pos["gas_usd"], "yrs": yrs}
+    # ---- delta-hedge overlay: nav_hedged is nav_naked + the three hedge lines (additive only). Present
+    #      ONLY in a hedged book (state has a `hedge`); a naked book returns the original marks untouched. ----
+    h = state.get("hedge")
+    if h:
+        contrib = h["pnl_usd"] + h["carry_usd"] - h["fees_usd"]        # the ONLY delta vs nav_naked
+        out.update({"nav_hedged": nav + contrib,
+                    "hedge_pnl": h["pnl_usd"], "hedge_carry": h["carry_usd"], "hedge_fees": h["fees_usd"],
+                    "hedge_notional": h["notional_usd"], "hedge_n": h["n_rehedges"],
+                    "eur_delta_usd": eur_delta_usd(pos["L_norm"], mid, pos["p_a"], pos["p_b"]),
+                    "gamma_resid_usd": gamma_resid_usd(pos, mid)})
+    return out
+
+
+# ---- delta-hedge eval (onchain_fx_hedge_001) -------------------------------------------------
+MIN_ANNUALIZE_YRS = 1.0 / 365.0   # don't annualize a sub-day window (matches live_render's headline rule):
+#   a few minutes of noise annualizes to absurd 1000s-of-% Sharpe. Below this we keep sum_r2 (for the
+#   SCALE-FREE vol ratio, which is honest short-window) but leave ann_vol/ann_ret/sharpe None.
+
+
+def _ann_stats(rows: list, key: str, rf: float = AAVE_USDC_APR) -> dict | None:
+    """Window return / vol / Sharpe of a NAV series, using the engine's OWN vol estimator (sum log-return^2
+    / sum dt, F3-consistent). Annualized fields are None until the window is >= 1 day; sum_r2 is always
+    returned so the naked-vs-hedged vol RATIO (annualization cancels) can be read even on a short window."""
+    pts = [(r["ts"], r.get(key)) for r in rows if r.get(key) is not None]
+    if len(pts) < 2:
+        return None
+    (t0, v0), (t1, vN) = pts[0], pts[-1]
+    yrs = (t1 - t0) / SEC_Y
+    if yrs <= 0 or v0 <= 0:
+        return None
+    sum_r2 = sum_dt = 0.0
+    for (ta, va), (tb, vb) in zip(pts, pts[1:]):
+        if va > 0 and vb > 0 and tb > ta:
+            sum_r2 += math.log(vb / va) ** 2
+            sum_dt += (tb - ta) / SEC_Y
+    out = {"n": len(pts), "yrs": yrs, "end_usd": vN, "sum_r2": sum_r2,
+           "ann_vol": None, "ann_ret": None, "sharpe": None}
+    if yrs >= MIN_ANNUALIZE_YRS and sum_dt > 0:               # only annualize a meaningful window
+        out["ann_vol"] = math.sqrt(sum_r2 / sum_dt)
+        out["ann_ret"] = (vN / v0 - 1.0) / yrs
+        out["sharpe"] = (out["ann_ret"] - rf) / out["ann_vol"] if out["ann_vol"] > 0 else None
+    return out
+
+
+def write_hedge_eval(state: dict) -> None:
+    """Upsert the single onchain_fx_hedge_001 eval row: live naked-vs-hedged Sharpe/vol over the HEDGED
+    window (rows carrying a nav_hedged). Question: does shorting the LP's EUR delta lift realized Sharpe
+    FORWARD? Honest headline: net APR ~flat — a Sharpe trade, not a yield trade. Forward-only, single-vol."""
+    h = state["hedge"]
+    hedged_rows = [r for r in state["nav_hist"] if r.get("nav_hedged") is not None]
+    naked, hedged = _ann_stats(hedged_rows, "nav"), _ann_stats(hedged_rows, "nav_hedged")
+    # scale-free vol ratio (the annualization factor cancels) — the honest signal even on a sub-day window
+    vol_ratio = (math.sqrt(hedged["sum_r2"] / naked["sum_r2"])
+                 if (naked and hedged and naked.get("sum_r2", 0) > 0) else None)
+    dvr = (1.0 - vol_ratio) if vol_ratio is not None else None     # directional vol removed (fraction)
+    lift = (hedged["sharpe"] / naked["sharpe"]) if (naked and hedged and naked.get("sharpe")
+            and hedged.get("sharpe") and naked["sharpe"] != 0) else None
+    row = {
+        "eval_id": "onchain_fx_hedge_001", "asof": state.get("last_tick_ts"),
+        "question": "Does shorting the LP's live EUR delta lift realized Sharpe forward (net APR ~flat)?",
+        "state": {"held_pool": state["position"]["pool"],
+                  "naked_delta_frac": h["notional_usd"] / state["book_usd"],
+                  "rehedge_band_pct": REHEDGE_BAND * 100, "carry_rate": CARRY_RATE,
+                  "perp_fee_bps": PERP_FEE_BPS, "n_rehedges": h["n_rehedges"], "hedged_ticks": len(hedged_rows)},
+        "action": "paper short EUR sized to eur_delta_usd(LP), re-sized on +/-1% band; carry booked at 0",
+        "measured": {"naked": naked, "hedged": hedged, "sharpe_lift": lift,
+                     "vol_ratio": vol_ratio, "directional_vol_removed_frac": dvr,
+                     "annualized_ready": bool(naked and naked.get("sharpe") is not None),
+                     "hedge_pnl_usd": h["pnl_usd"], "hedge_carry_usd": h["carry_usd"],
+                     "hedge_cost_usd": h["fees_usd"]},
+        "honest_headline": "Sharpe improver, not a yield improver: removes DELTA, never LVR (gamma "
+                           "unhedgeable onchain). Single-window / single-vol-regime, forward-only.",
+        "score_against": "realized forward naked-vs-hedged Sharpe + vol as the live run lengthens",
+    }
+    keep = []
+    if HEDGE_EVAL.exists():
+        for line in HEDGE_EVAL.read_text().splitlines():
+            if line.strip() and json.loads(line).get("eval_id") != row["eval_id"]:
+                keep.append(json.loads(line))
+    keep.append(row)
+    HEDGE_EVAL.write_text("\n".join(json.dumps(r, default=float) for r in keep) + "\n")
 
 
 # ---- the tick --------------------------------------------------------------------------------
@@ -484,14 +722,82 @@ def tick() -> dict:
         if br["state"] in ("OK", "DISLOCATED") and br.get("dev_bps") == br.get("dev_bps") and br.get("dev_bps") is not None:
             state["basis_hist"] = (state["basis_hist"] + [br["dev_bps"]])[-BASIS_HIST_MAX:]
 
+    # ---- delta-hedge overlay: size / mark / re-size (after recenter+scanner+realloc, before nav_marks) ----
+    # Runs ONLY in a hedged book (ONCHAIN_FX_HEDGE=1). A naked book never enters here -> byte-identical output.
+    # STALE never reaches here (frozen above). FX_CLOSED / DISLOCATED -> mark-only (no re-size). OK -> full.
+    hres = h_snapshot = None
+    if HEDGE_ON:
+        state["hedge_enabled"] = True          # the renderer branches on this to show the hedge UI + tab
+        state.setdefault("hedge", None)
+    if HEDGE_ON and state["position"] is not None and br["state"] != "STALE":
+        pos_h = state["position"]
+        mid_h = feed["pools"][pos_h["pool"]]["mark_mid"]
+        if state["hedge"] is None:
+            # lazy open — covers BOTH true inception and a running-book MIGRATION (state.json with no `hedge`
+            # key). Sizing the short IS a trade, so it is OK-GATED like a resize (D5): defer the open if the
+            # first non-STALE tick is FX_CLOSED/DISLOCATED (don't anchor entry_mid off an untrusted-FV tick).
+            # Wrapped fail-closed so a malformed open (e.g. the sign gate raising) can NEVER freeze the
+            # validated naked book — it defers and flags instead.
+            if br["state"] == "OK":
+                try:
+                    state["hedge"] = hedge_open(state, pos_h, mid_h, now_ts)
+                    state.pop("hedge_open_fault", None)
+                    actions.append({"type": "HEDGE_OPEN", "notional_usd": state["hedge"]["notional_usd"],
+                                    "mid": mid_h, "frac_of_book": state["hedge"]["notional_usd"] / state["book_usd"]})
+                except Exception as e:
+                    state["hedge"] = None
+                    state["hedge_open_fault"] = str(e)
+                    actions.append({"type": "HEDGE_FAULT", "gate": f"open: {e}"})
+                    print(f"  [HEDGE_OPEN deferred — {e}; naked book intact]")
+        else:
+            h_snapshot = dict(state["hedge"])              # last-good copy for fail-closed revert + G7
+            # a recenter/realloc this tick moved the band -> the LP delta jumped -> force a re-size (D1)
+            force = any(a["type"] in ("RECENTER", "REALLOCATE") for a in actions)
+            hres = hedge_step(state, pos_h, mid_h, br["state"], now_ts, force)
+            if hres["resized"]:
+                actions.append({"type": "REHEDGE", "notional_usd": state["hedge"]["notional_usd"],
+                                "mid": mid_h, "residual_before": hres["residual_before"],
+                                "eur_move": hres["eur_move"], "forced": force,
+                                "n_rehedges": state["hedge"]["n_rehedges"]})
+
     # ---- NAV marks (every non-failed tick that has a position) ----
     marks = None
     if state["position"] is not None and br["state"] != "STALE":
-        mid = feed["pools"][state["position"]["pool"]]["mark_mid"]
-        marks = nav_marks(state, state["position"], mid, now_ts)
+        pos = state["position"]
+        mid = feed["pools"][pos["pool"]]["mark_mid"]
+        marks = nav_marks(state, pos, mid, now_ts)
+        # fail-closed conservation gates: a breach REVERTS the overlay to last-good (the naked book is the
+        # validated engine and stays byte-identical), flags the fault, and never persists a corrupted hedge.
+        if state.get("hedge") is not None:
+            try:
+                assert_conservation(state, pos, mid, marks, h_snapshot, hres, br["state"])
+                state["hedge"].pop("fault", None)
+            except Exception as e:   # broad on purpose: ANY gate failure (assert OR a compute error on a
+                #                      corrupted state) must revert the overlay, never freeze the naked book.
+                if h_snapshot is not None:
+                    # step path: revert to last-good, re-mark its unrealized at the CURRENT mid (mark-only,
+                    # no resize) so the persisted nav_hist row is internally consistent with its own mid.
+                    state["hedge"] = h_snapshot
+                    state["hedge"]["last_mid"] = mid
+                    state["hedge"]["pnl_usd"] = state["hedge"]["realized_usd"] + _hedge_unrealized(state["hedge"], mid)
+                    state["hedge"]["fault"] = str(e)
+                else:
+                    # fresh-open path: un-open and record a sticky open fault (retried next OK tick)
+                    state["hedge"] = None
+                    state["hedge_open_fault"] = str(e)
+                marks = nav_marks(state, pos, mid, now_ts)   # re-mark on the reverted (good) hedge
+                actions.append({"type": "HEDGE_FAULT", "gate": str(e)})
+                print(f"  [HEDGE_FAULT {e} — overlay reverted; naked book intact]")
+        row_h = {}
+        if marks.get("hedge_notional") is not None:
+            row_h = {"nav_hedged": marks["nav_hedged"], "hedge_pnl": marks["hedge_pnl"],
+                     "hedge_carry": marks["hedge_carry"], "hedge_fees": marks["hedge_fees"],
+                     "hedge_notional": marks["hedge_notional"], "eur_delta": marks["eur_delta_usd"],
+                     "gamma_resid": marks["gamma_resid_usd"],
+                     "L_norm": pos["L_norm"], "p_a": pos["p_a"], "p_b": pos["p_b"]}   # geometry for forward audit
         state["nav_hist"] = (state["nav_hist"] + [{
             "ts": now_ts, "nav": marks["nav"], "hodl": marks["hodl"], "aave": marks["aave"],
-            "mid": mid, "breaker": br["state"]}])[-5000:]
+            "mid": mid, "breaker": br["state"], **row_h}])[-5000:]
 
     state["breaker"] = {**br, "since": now_ts if state["breaker"]["state"] != br["state"] else state["breaker"]["since"]}
     state["last_tick_ts"] = now_ts
@@ -513,7 +819,21 @@ def tick() -> dict:
            "gas_cum": pos["gas_usd"] if pos else None, "n_recenters": pos["n_recenters"] if pos else None,
            "n_reallocations": state["n_reallocations"],
            "actions": actions}
+    # ---- delta-hedge overlay fields (hedged book only; naked ledger stays byte-identical) ----
+    if state.get("hedge") is not None:
+        row.update({"nav_hedged": marks.get("nav_hedged") if marks else None,
+                    "hedge_notional": marks.get("hedge_notional") if marks else None,
+                    "hedge_pnl": marks.get("hedge_pnl") if marks else None,
+                    "hedge_carry": marks.get("hedge_carry") if marks else None,
+                    "hedge_fees": marks.get("hedge_fees") if marks else None,
+                    "gamma_resid": marks.get("gamma_resid_usd") if marks else None,
+                    "n_rehedges": state["hedge"]["n_rehedges"],
+                    "hedge_fault": state["hedge"].get("fault")})
     append_ledger(row)
+
+    # ---- delta-hedge eval row (onchain_fx_hedge_001): naked-vs-hedged Sharpe/vol, scored paper-live ----
+    if state.get("hedge") is not None and marks is not None:
+        write_hedge_eval(state)
 
     # ---- render ----
     try:
@@ -545,6 +865,12 @@ def _print_tick(res: dict) -> None:
         nav, hodl, aave = m["nav"], m["hodl"], m["aave"]
         print(f"   NAV ${nav:,.2f}  vs HODL ${hodl:,.2f} ({(nav-hodl):+,.2f})  "
               f"vs Aave ${aave:,.2f} ({(nav-aave):+,.2f})  · fees ${m['fees']:.3f}  LVR-diag ${m['lvr_diag']:.3f}")
+        h = st.get("hedge")
+        if h and m.get("nav_hedged") is not None:
+            fault = f"  !! HEDGE_FAULT {h['fault']}" if h.get("fault") else ""
+            print(f"   HEDGED ${m['nav_hedged']:,.2f} ({m['nav_hedged']-nav:+,.2f} vs naked)  · short ${h['notional_usd']:,.0f} "
+                  f"({h['notional_usd']/st['book_usd']*100:.0f}% book)  pnl ${h['pnl_usd']:+.2f}  carry ${h['carry_usd']:+.2f}  "
+                  f"cost ${h['fees_usd']:.2f}  rehedges {h['n_rehedges']}  γ-resid ${m.get('gamma_resid_usd',0):+.2f}{fault}")
 
 
 def main() -> None:

@@ -1,12 +1,9 @@
-# @purpose live.yml — the always-on host for the Onchain FX live paper LP (forward-press tool).
-#   Every 15 min: run one live_lp.py tick (poll the public Base RPC + Pyth, advance the paper LP, scan,
-#   recenter, render live.html), then commit live.html + state.json + live_ledger.jsonl back to the repo —
-#   GitHub Pages serves the updated watch UI at the "Live LP" tab. Public repo ⇒ unlimited Actions minutes.
-#
-#   No secrets (both feeds are public). No pip installs (the tool is pure stdlib — economics vendored in
-#   live_econ.py, Pyth/RPC via urllib). Best-effort cron (delays + 60-day inactivity auto-disable): the
-#   self-healing block cursor widens a delayed tick's window instead of dropping volume, and the UI ages a
-#   liveness lamp. PAPER ONLY — NAV is notional, no capital, no on-chain actions.
+# @purpose live.yml — always-on host for the Onchain FX live paper LP. Runs TWO parallel books each tick:
+#   the NAKED forward-press LP (state.json + live.html) and the DELTA-HEDGED book (hedged/ + live_hedged.html,
+#   ONCHAIN_FX_HEDGE=1 — a paper short-EUR overlay sized to the LP's live EUR delta, isolating fee-minus-LVR
+#   carry). The hedged step is continue-on-error so the overlay can NEVER freeze the validated naked book.
+#   GitHub Pages serves both at the "Live LP" / "Live LP · Hedged" tabs. No secrets (public feeds), no pip
+#   (pure stdlib — economics vendored in live_econ.py, Pyth/RPC via urllib). PAPER ONLY — NAV is notional.
 
 name: live-lp
 
@@ -32,17 +29,26 @@ jobs:
         with:
           python-version: "3.11"   # stdlib only — no `pip install`
 
-      - name: Run one live tick → render live.html
+      - name: Naked book — one live tick → render live.html
         env:
           ONCHAIN_FX_LIVE_DIR: ${{ github.workspace }}   # state + ledger + UI at the repo root
           ONCHAIN_FX_LIVE_OUT: live.html                 # publish the watch UI at the Live LP tab
         run: python live_lp.py tick
 
-      - name: Commit state + watch UI
+      - name: Hedged book — one live tick → render live_hedged.html
+        continue-on-error: true                          # a hedge-overlay fault must never block the naked book
+        env:
+          ONCHAIN_FX_HEDGE: "1"                          # turn the paper short-EUR overlay on for THIS book only
+          ONCHAIN_FX_LIVE_DIR: ${{ github.workspace }}/hedged   # its own state/ledger (forked from the naked book)
+          ONCHAIN_FX_LIVE_OUT: ${{ github.workspace }}/live_hedged.html   # absolute → publish at the repo root
+        run: python live_lp.py tick
+
+      - name: Commit state + watch UIs (both books)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f live.html state.json live_ledger.jsonl
+          git add -f live_hedged.html hedged/state.json hedged/live_ledger.jsonl hedged/hedge_eval.jsonl 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "no change this tick"; exit 0
           fi

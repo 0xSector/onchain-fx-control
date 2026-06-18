@@ -28,6 +28,8 @@ OUT = LIVE / os.environ.get("ONCHAIN_FX_LIVE_OUT", "live_book.html")
 LEDGER = LIVE / "live_ledger.jsonl"
 # Cross-link target for the nav tab (the control-panel dashboard). Same-repo relative path on Pages.
 DASHBOARD_HREF = os.environ.get("ONCHAIN_FX_DASHBOARD_HREF", "index.html")
+NAKED_HREF = os.environ.get("ONCHAIN_FX_NAKED_HREF", "live.html")       # the naked LP tab target on Pages
+HEDGED_HREF = os.environ.get("ONCHAIN_FX_HEDGED_HREF", "live_hedged.html")  # the delta-hedged LP tab target
 SEC_Y = 365.0 * 24 * 3600.0
 REFRESH_S = 120
 
@@ -38,7 +40,7 @@ def _fmt_ts(ts) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
 
 
-def _svg_curve(hist: list, w: int = 940, h: int = 240, pad: int = 38) -> str:
+def _svg_curve(hist: list, show_hedge: bool = False, w: int = 940, h: int = 240, pad: int = 38) -> str:
     """Inline SVG equity curve: NAV (gold) vs HODL (blue) vs Aave (faint) over nav_hist, with a $10k
     reference line. Downsamples to ~320 points. No external libs - offline portable."""
     if len(hist) < 2:
@@ -49,9 +51,10 @@ def _svg_curve(hist: list, w: int = 940, h: int = 240, pad: int = 38) -> str:
     if pts[-1] is not hist[-1]:
         pts = pts + [hist[-1]]
     xs = [p["ts"] for p in pts]
-    series = {"nav": [p["nav"] for p in pts], "hodl": [p["hodl"] for p in pts], "aave": [p["aave"] for p in pts]}
+    series = {"nav": [p["nav"] for p in pts], "hodl": [p["hodl"] for p in pts], "aave": [p["aave"] for p in pts],
+              "hedged": [p.get("nav_hedged", p["nav"]) for p in pts]}   # pre-overlay rows: hedged coincides w/ NAV
     t0, t1 = min(xs), max(xs)
-    allv = series["nav"] + series["hodl"] + series["aave"] + [pts[0]["nav"]]
+    allv = series["nav"] + series["hodl"] + series["aave"] + [pts[0]["nav"]] + (series["hedged"] if show_hedge else [])
     lo, hi = min(allv), max(allv)
     span = (hi - lo) or 1.0
     lo -= span * 0.08
@@ -87,6 +90,7 @@ def _svg_curve(hist: list, w: int = 940, h: int = 240, pad: int = 38) -> str:
     body = (grid
             + path(series["aave"], "#7a7d76", 1.3, "4,3")
             + path(series["hodl"], "#8ab4d8", 1.6)
+            + (path(series["hedged"], "#7fd49a", 1.9) if show_hedge else "")
             + path(series["nav"], "#d8b86a", 2.2))
     return f'<svg viewBox="0 0 {w} {h}" width="100%" preserveAspectRatio="xMidYMid meet">{body}</svg>'
 
@@ -136,6 +140,118 @@ def _lamp(state: str, label: str) -> str:
     return f'<span class="lamp {color}">●</span> {label}'
 
 
+# ---- delta-hedge overlay panels --------------------------------------------------------------
+HEDGE_EVAL = LIVE / "hedge_eval.jsonl"
+
+
+def _read_hedge_eval() -> dict | None:
+    if not HEDGE_EVAL.exists():
+        return None
+    rows = [json.loads(l) for l in HEDGE_EVAL.read_text().splitlines() if l.strip()]
+    return rows[-1] if rows else None
+
+
+def _gauge(label: str, frac: float, color: str, cap: float = 0.55) -> str:
+    """Horizontal exposure gauge: |frac| of book drawn against a fixed cap so naked (~49%) and hedged
+    residual (~0, drifting to ~16% between rehedges) are visually comparable on one scale."""
+    w = max(0.6, min(100.0, abs(frac) / cap * 100.0))
+    return (f'<div class="gauge"><div class="gl">{label}</div>'
+            f'<div class="gtrack"><div class="gfill" style="width:{w:.1f}%;background:{color}"></div></div>'
+            f'<div class="gv">{frac*100:+.1f}%</div></div>')
+
+
+def _hedge_section(state: dict, hist: list, dep: float) -> str:
+    h = state.get("hedge")
+    if not h:
+        of = state.get("hedge_open_fault")
+        if of:
+            return ('<h2>Delta-hedge overlay — paper short-EUR</h2>'
+                    f'<div class="banner r">⚠ HEDGE_OPEN deferred — {of}. The short did not size this tick; '
+                    'the naked book is unaffected. Retries on the next OK tick.</div>')
+        return ('<h2>Delta-hedge overlay — paper short-EUR</h2>'
+                '<div class="empty">the short opens on the next OK tick (sized only when the breaker is OK — '
+                'lazy migration, no book reset)</div>')
+    last = hist[-1] if hist else {}
+    nav_naked = last.get("nav", dep)
+    navH = last.get("nav_hedged", nav_naked)
+    eur_delta = last.get("eur_delta", h["notional_usd"])
+    resid = eur_delta - h["notional_usd"]
+    gamma = last.get("gamma_resid", 0.0)
+
+    ev = _read_hedge_eval()
+
+    m = (ev or {}).get("measured") or {}
+    nk, hd = m.get("naked"), m.get("hedged")
+    dvr = m.get("directional_vol_removed_frac")
+    if m.get("annualized_ready") and nk and hd and nk.get("sharpe") is not None and hd.get("sharpe") is not None:
+        # window >= 1d: annualized Sharpe is meaningful
+        sharpe_line = (f"directional vol {nk['ann_vol']*100:.1f}% → {hd['ann_vol']*100:.1f}% · "
+                       f"Sharpe {nk['sharpe']:.2f} → {hd['sharpe']:.2f} · forward-only, single-vol")
+    elif dvr is not None and nk and nk.get("n", 0) >= 3:
+        # sub-day window: annualized Sharpe is meaningless — show only the scale-free vol cut
+        runh = nk["yrs"] * 365 * 24
+        sharpe_line = f"directional vol cut ~{dvr*100:.0f}% (scale-free) · annualized Sharpe after 1d (run {runh:.1f}h)"
+    else:
+        sharpe_line = "naked-vs-hedged vol/Sharpe accumulating (a few more hedged ticks needed)"
+
+    fault = h.get("fault")
+    fault_html = (f'<div class="banner r">⚠ HEDGE_FAULT {fault} — overlay reverted to last-good; '
+                  f'the naked book is intact.</div>' if fault else "")
+    carry_txt = "booked at 0" if h["carry_usd"] == 0 else f"${h['carry_usd']:+.2f} (toggled on)"
+    gauge = (_gauge("naked EUR delta", eur_delta / dep, "#e07856")
+             + _gauge("hedged residual", resid / dep, "#7fd49a"))
+    pnl_cls = "good" if h["pnl_usd"] >= 0 else "bad"
+    return f"""
+<h2>Delta-hedge overlay — paper short-EUR (a Sharpe trade, not a yield trade)</h2>
+{fault_html}
+<div class="grid2">
+  <div class="hcard">
+    <div class="cl">Hedged NAV</div>
+    <div class="cv" style="color:#7fd49a">${navH:,.2f}</div>
+    <div class="cs">vs naked ${nav_naked:,.2f} ({navH-nav_naked:+,.2f}) · {sharpe_line}</div>
+    <div class="gaugewrap">{gauge}</div>
+    <div class="cs" style="font-size:10.5px;color:var(--faint);margin-top:2px">residual ≈ 0 at each sizing; the LP's gamma drifts it to ~±16% of book just before the next ±1% rehedge (the disclosed, un-removed drift).</div>
+    <div class="cs" style="margin-top:9px">γ-residual (the un-hedgeable LVR, −1% ref move):
+      <b style="color:#e07856">${gamma:+.2f}</b> — the hedge removes <b>DELTA</b>, never LVR (gamma unhedgeable onchain).</div>
+  </div>
+  <div>
+    <table class="kv">
+      <tr><td>short notional</td><td class="num">${h['notional_usd']:,.0f}</td><td>entry mid</td><td class="num">{h['entry_mid']:.5f}</td></tr>
+      <tr><td>hedge P&amp;L</td><td class="num {pnl_cls}">${h['pnl_usd']:+.2f}</td><td>realized</td><td class="num">${h.get('realized_usd',0.0):+.2f}</td></tr>
+      <tr><td>rehedges</td><td class="num">{h['n_rehedges']}</td><td>perp cost</td><td class="num bad">${h['fees_usd']:.2f}</td></tr>
+      <tr><td>carry</td><td class="num">{carry_txt}</td><td>band</td><td class="num">±1% EUR move</td></tr>
+    </table>
+    <div class="meta" style="margin-top:7px">Neutral at each sizing, drifts with gamma between rehedges — <b>not continuously neutral</b>.
+    Sized to the LP's live EUR $-delta (~49% of book), marked on the LP's own mid (single feed). Carry booked at 0; any + carry is upside.
+    Paper only — no venue, no funds: basis between the legs is <b>0 by construction</b> (same mid), not in reality (a real Ostium short carries ~7.6bp EURC-vs-spot residual the paper model omits).</div>
+  </div>
+</div>"""
+
+
+def _hedge_lamps(state: dict, hist: list) -> str:
+    h = state.get("hedge")
+    if not h:
+        if state.get("hedge_open_fault"):
+            return f'<div><span class="lamp r">●</span> hedge: OPEN deferred ({state["hedge_open_fault"]})</div>'
+        return ""
+    last = hist[-1] if hist else {}
+    dep = state["book_usd"]
+    eur_delta = last.get("eur_delta", h["notional_usd"])
+    resid_frac = abs(eur_delta - h["notional_usd"]) / dep
+    neu = "g" if resid_frac < 0.02 else ("a" if resid_frac < 0.18 else "r")
+    carry = h["carry_usd"]
+    out = [
+        f'<div><span class="lamp {neu}">●</span> hedge neutrality: residual {resid_frac*100:.1f}% of book</div>',
+        f'<div><span class="lamp {"g" if carry==0 else "a"}">●</span> carry: '
+        f'{"booked @ 0" if carry==0 else f"${carry:+.2f} toggled"}</div>',
+    ]
+    if h.get("fault"):
+        out.append(f'<div><span class="lamp r">●</span> conservation: HEDGE_FAULT {h["fault"]} (reverted)</div>')
+    else:
+        out.append('<div><span class="lamp g">●</span> conservation: 8 identities + sign self-test, fail-closed</div>')
+    return "".join(out)
+
+
 def render(state: dict, last_row: dict) -> None:
     pos = state.get("position")
     inc_ts = state["inception_ts"]
@@ -143,6 +259,7 @@ def render(state: dict, last_row: dict) -> None:
     br = state.get("breaker", {})
     hist = state.get("nav_hist", [])
     dep = state["book_usd"]
+    show_hedge = bool(state.get("hedge_enabled"))   # True only in the hedged book -> hedge curve/section/tab
 
     # headline marks
     if hist:
@@ -152,8 +269,6 @@ def render(state: dict, last_row: dict) -> None:
         nav = hodl = aave = dep
         mid = pos["entry_mid"] if pos else float("nan")
     yrs = (last_ts - inc_ts) / SEC_Y if last_ts else 0.0
-    vs_hodl = nav - hodl
-    vs_aave = nav - aave
     # Don't annualize a sub-day window — a few minutes of noise annualizes to absurd ±1000s of %.
     # The single-window caveat "decays as the run lengthens": show period P&L until >=1 day elapsed.
     MIN_ANNUALIZE_YRS = 1.0 / 365.0
@@ -170,10 +285,12 @@ def render(state: dict, last_row: dict) -> None:
         return (f'<div class="card {cls}"><div class="cl">{label}</div>'
                 f'<div class="cv">{val}</div><div class="cs">{sub}</div></div>')
 
+    # Absolute held-values, not deltas: show what each alternative position would be worth right now on the
+    # same $10k + window, so the reader compares the three dollar figures directly (NAV vs HODL vs Aave).
     headline = "".join([
         card("Paper NAV", f"${nav:,.2f}", f"on ${dep:,.0f} · {state['n_ticks']} ticks"),
-        card("vs HODL basket", f"{vs_hodl:+,.2f}", "strategy alpha (IL peer)", "good" if vs_hodl >= 0 else "bad"),
-        card("vs Aave USDC", f"{vs_aave:+,.2f}", f"do-nothing @ {4.5:.1f}%", "good" if vs_aave >= 0 else "bad"),
+        card("HODL basket", f"${hodl:,.2f}", "held inception EURC+USDC (IL peer)"),
+        card("Aave USDC", f"${aave:,.2f}", f"do-nothing @ {4.5:.1f}%"),
         card("P&L / Net APR", apr_val, apr_sub, apr_cls),
     ])
 
@@ -236,11 +353,24 @@ def render(state: dict, last_row: dict) -> None:
         f'<div><span class="lamp g">●</span> σ: {sig*100:.1f}% ({sig_src})</div>',
         f'<div><span class="lamp g">●</span> gas: {last_row.get("gas_gwei",float("nan")):.4f} gwei</div>',
         f'<div id="liveness"><span class="lamp f">●</span> last tick: <span id="age">{_fmt_ts(last_ts)}</span></div>',
+        _hedge_lamps(state, hist) if show_hedge else "",
     ])
 
-    curve = _svg_curve(hist)
+    curve = _svg_curve(hist, show_hedge)
     decisions = _decision_rows()
+    hedge_section = _hedge_section(state, hist, dep) if show_hedge else ""
     breaker_banner = ""
+
+    # 3-tab nav (Market Structure / Live LP / Live LP · Hedged); the current book's tab is highlighted
+    def _tab(href, label, on):
+        return f'<a class="{"on" if on else ""}" href="{href}">{label}{" ●" if on else ""}</a>'
+    navbar = ('<nav class="nav">' + f'<a href="{DASHBOARD_HREF}">Market Structure</a>'
+              + _tab(NAKED_HREF, "Live LP", not show_hedge)
+              + _tab(HEDGED_HREF, "Live LP · Hedged", show_hedge) + '</nav>')
+    title_v = "· Live LP · Delta-Hedged · Watch" if show_hedge else "· Live LP · Watch"
+    legend = ('<div class="legend"><b class="lg">━ NAV' + (' (naked LP)' if show_hedge else ' (LP)') + '</b>'
+              + ('<b style="color:#7fd49a">━ Hedged NAV</b>' if show_hedge else '')
+              + '<b class="lb">━ HODL basket</b><b class="lf">╌ Aave USDC</b></div>')
     if br.get("state") in ("STALE", "DISLOCATED", "FX_CLOSED"):
         bc = {"STALE": "r", "DISLOCATED": "a", "FX_CLOSED": "a"}[br["state"]]
         breaker_banner = (f'<div class="banner {bc}">⚠ {br["state"]} — {br.get("reason","")}. '
@@ -272,6 +402,13 @@ font-family:var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(
 .cv{{font-size:23px;font-family:var(--mono);margin:5px 0 2px;color:var(--ink)}}
 .cs{{font-size:11.5px;color:var(--dim)}}
 .card.good .cv{{color:var(--green)}} .card.bad .cv{{color:var(--red)}}
+.hcard{{background:var(--panel);border:1px solid var(--edge);border-left:3px solid var(--green);border-radius:7px;padding:14px 16px}}
+.gaugewrap{{margin:12px 0 2px}}
+.gauge{{display:flex;align-items:center;gap:9px;margin:5px 0}}
+.gl{{font-family:var(--mono);font-size:10.5px;color:var(--faint);width:104px}}
+.gtrack{{flex:1;height:9px;background:var(--panel2);border:1px solid var(--edge);border-radius:5px;overflow:hidden}}
+.gfill{{height:100%;border-radius:5px}}
+.gv{{font-family:var(--mono);font-size:11px;color:var(--dim);width:52px;text-align:right}}
 .chart{{background:var(--panel);border:1px solid var(--edge);border-radius:7px;padding:12px 8px 4px;margin:12px 0}}
 .legend{{font-family:var(--mono);font-size:11px;color:var(--faint);padding:2px 10px 8px;display:flex;gap:18px}}
 .legend b{{font-weight:400}} .lg{{color:var(--gold)}} .lb{{color:var(--blue)}} .lf{{color:var(--faint)}}
@@ -314,9 +451,9 @@ padding:7px 15px;border:1px solid var(--edge);border-bottom:none;border-radius:6
 .nav a.on{{color:var(--gold);background:var(--bg);border-color:var(--edge2);border-bottom:1px solid var(--bg);position:relative;top:1px}}
 </style></head>
 <body><div class="wrap">
-<nav class="nav"><a href="{DASHBOARD_HREF}">Market Structure</a><a class="on" href="#">Live LP ●</a></nav>
+{navbar}
 <header style="border-top:1px solid var(--edge);padding-top:22px">
-  <h1>Onchain FX <span class="v">· Live LP · Watch</span></h1>
+  <h1>Onchain FX <span class="v">{title_v}</span></h1>
   <div class="meta">autonomous paper LP pressed forward against live Base feeds · {state['corridor'].upper()} on Base ·
   inception {_fmt_ts(inc_ts)} · last tick {_fmt_ts(last_ts)} · auto-refresh {REFRESH_S}s<br>
   PAPER ONLY — NAV is notional, no capital, no on-chain actions. Engine reused unchanged (book.py / sim.py, adversarially reviewed); live layer = feed + state + scanner + breaker.</div>
@@ -327,8 +464,10 @@ padding:7px 15px;border:1px solid var(--edge);border-bottom:none;border-radius:6
 <h2>Headline — forward equity vs the two baselines</h2>
 <div class="cards">{headline}</div>
 <div class="chart">{curve}
-  <div class="legend"><b class="lg">━ NAV (LP)</b><b class="lb">━ HODL basket</b><b class="lf">╌ Aave USDC</b></div>
+  {legend}
 </div>
+
+{hedge_section}
 
 <div class="grid2">
   <div>
