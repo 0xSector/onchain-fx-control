@@ -20,8 +20,15 @@ REF_RANGE = 0.03                    # +/-3% reference LP band (headline LVR deco
 WEEKS_Y = 52.0
 SEC_Y = 365.0 * 24 * 3600.0         # seconds per year (calendar)
 AAVE_USDC_APR = 0.045               # do-nothing opportunity-cost baseline (USDC supply)
-MIN_TVL = 300_000.0                 # investability floor: pool deep enough that fees/TVL is a real APR
-MIN_VOL_WK = 1_000_000.0            # genuine two-sided organic flow, not a handful of fills
+# Allocation screen for the LIVE paper sim (loosened 2026-06-18 per Tim: it's paper, so let the forward
+# press allocate into more pools and produce REAL forward results — including the thin-TVL pools the
+# BACKTEST screened out as wash-inflated). The backtest (book.py/sim.py) keeps its stricter $300k/$1M
+# floor; only this vendored copy is relaxed. WATCH: aero_c5e5 ($219k TVL / ~$24M-wk) modeled ~+900% from
+# its wash-looking vol/TVL ratio — the scanner WILL allocate there; whether a passive $10k LP actually
+# earns it (vs JIT dilution) is exactly what the forward sim now measures. NAV accrues on ACTUAL on-chain
+# interval volume × the live L-unit share, so the result is honest even where the modeled APR is inflated.
+MIN_TVL = 100_000.0                 # investability floor (live): pool TVL >= $100k
+MIN_VOL_WK = 100_000.0             # organic flow floor (live): >= $100k/wk swap volume
 
 
 # ---- LVR / capital efficiency (book.py) ------------------------------------------------------

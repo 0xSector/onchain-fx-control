@@ -4,15 +4,24 @@
 #          Swap-log pull (minutes of ingestion lag, query budget) for the per-tick loop; Allium stays
 #          the weekly validation/backfill layer.
 #
-#          Per pool, per tick, this exposes (all verified live 2026-06-17 on https://mainnet.base.org):
-#            - MARK mid  : observe([TWAP_S,0]) -> 5-min TWAP  (ROBUST mark, review F1 - never mark on spot)
-#            - SPOT mid  : slot0() sqrtPriceX96               (breaker spot-vs-Pyth check ONLY)
-#            - L_active  : liquidity()                        (in-range liquidity, for the F2 L-unit fee share)
-#            - volume    : eth_getLogs(Swap) from last_block  (self-healing interval volume, review F5)
+#          TWO pool kinds, dispatched by POOLS[label]["kind"]:
+#            v3  (Uniswap-v3-family: Aerodrome/Pancake/Alien/Uniswap) - one CONTRACT per pool; reads
+#                slot0()/liquidity()/observe() on the pool address; Swap logs on the pool address.
+#            v4  (Uniswap v4) - a SINGLETON PoolManager; pools are keyed by poolId (no per-pool address,
+#                no slot0/observe). mid+L read via the Base StateView getSlot0/getLiquidity(poolId); Swap
+#                logs read on the PoolManager filtered by topic1=poolId. v4 has no built-in oracle, so the
+#                mark falls back to SPOT (flagged mark_is_spot) - acceptable because all v4 pools here are
+#                WATCH-ONLY (screened ineligible in live_lp, never hold the paper book).
+#
+#          Per pool, per tick, this exposes (verified live 2026-06-17 v3 / 2026-06-18 v4 on Base RPC):
+#            - MARK mid  : v3 observe([TWAP_S,0]) 5-min TWAP (F1); v4 spot (no oracle -> mark_is_spot)
+#            - SPOT mid  : v3 slot0() / v4 StateView.getSlot0(poolId) sqrtPriceX96  (breaker spot-vs-Pyth)
+#            - L_active  : v3 liquidity() / v4 StateView.getLiquidity(poolId)        (F2 L-unit fee share)
+#            - volume    : eth_getLogs(Swap) from last_block (v3 on pool / v4 on PoolManager+poolId, F5)
 #            - gas, block, block_ts
 #
-#          mid = (sqrtPriceX96 / 2^96)^2 * 10^(dec0-dec1). All pools are EURC(6)/USDC(6), token0=EURC,
-#          equal decimals -> mid = (sqrtP/2^96)^2 = USD per EUR (matches the tape `p` convention).
+#          mid = (sqrtPriceX96 / 2^96)^2 * 10^(dec0-dec1). All pools are EUR-stable(6)/USD-stable(6),
+#          token0=EUR, equal decimals -> mid = (sqrtP/2^96)^2 = USD per EUR (matches the tape `p` convention).
 #          TWAP price = 1.0001^avgTick where avgTick = (tickCum[1]-tickCum[0]) / TWAP_S (token1/token0).
 #
 #          Read-only public market data. No auth, no wallet, no on-chain actions. Paper tool.
@@ -34,29 +43,43 @@ RPCS = [
 ]
 UA = {"Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (onchain-fx-research; read-only)"}
 
-SWAP_TOPIC0 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"
+SWAP_TOPIC0 = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67"  # v3 Swap
 Q96 = 2 ** 96
 TWAP_S = 300                       # 5-min TWAP window for the robust mark (review F1)
 GETLOGS_CHUNK = 5_000              # max block span per eth_getLogs (public-RPC friendly); chunked if gap larger
 
-# label -> (address, fee_bps, dec0, dec1). All token0=EUR-stable(6) / token1=USD-stable(6), so
-# mid = (sqrtPriceX96/2^96)^2 = USD per EUR (10^(dec0-dec1)=1). Verified live 2026-06-17 via token0/token1/
-# fee/decimals introspection. The 3 Aerodrome tiers are the deep, screen-passing set (S2 clean mids); the
-# rest are THIN Base EUR pools added for visibility only (all <$300k TVL -> watch-not-allocate in live_lp).
-# Tessera / Uniswap-v4 / Curve / Balancer / Aerodrome-v2 EUR pools are NOT here (no readable v3 slot0 mid).
+# ---- Uniswap v4 (singleton) constants (Base) ------------------------------------------------
+# v4 has no per-pool contract: every pool lives in one PoolManager and is keyed by poolId. mid+L are read
+# from the StateView lens contract; volume from PoolManager Swap logs filtered by topic1=poolId.
+V4_POOL_MANAGER = "0x498581ff718922c3f8e6a244956af099b2652b2b"   # Base v4 PoolManager
+V4_STATEVIEW    = "0xa3c0c9b65bad0b08107aa264b0f3db444b867a71"   # Base v4 StateView (verified 2026-06-18)
+V4_SWAP_TOPIC0  = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f"  # v4 Swap event
+SEL_GETSLOT0    = "0xc815641c"     # StateView.getSlot0(bytes32) -> (sqrtPriceX96, tick, protoFee, lpFee)
+SEL_GETLIQUIDITY = "0xfa6793d5"    # StateView.getLiquidity(bytes32) -> uint128
+
+# label -> {kind, addr|pool_id, fee_bps, dec0, dec1}. All token0=EUR-stable(6) / token1=USD-stable(6), so
+# mid = (sqrtPriceX96/2^96)^2 = USD per EUR (10^(dec0-dec1)=1). v3 verified live 2026-06-17 via token0/
+# token1/fee/decimals introspection; v4 confirmed 2026-06-18 (probe_v4_pools.py: deterministic poolId =
+# keccak(abi.encode(PoolKey)) + StateView read + mid reconciled to v3 within 0.1bp). The 3 Aerodrome tiers
+# are the deep, screen-passing set (S2 clean mids); the rest are THIN Base EUR pools for visibility only
+# (all <$300k TVL -> watch-not-allocate in live_lp). Tessera / Curve / Balancer / Aerodrome-v2 EUR pools
+# are NOT here (no readable mid). Only the ONE active no-hook v4 EUR pool is added; the other no-hook v4
+# combos are initialized-but-dead (L=0/$0), and hook-bearing v4 EUR pools aren't token-confirmable yet.
 POOLS = {
-    "aero_e846":    ("0xe846373c1a92b167b4e9cd5d8e4d6b1db9e90ec7", 5,  6, 6),  # deepest TVL ($2.87M), canonical mid
-    "aero_f39b":    ("0xf39b7c34be147f5dc1bc374f27af2e9f03ad3113", 1,  6, 6),  # 1bp tier, highest volume
-    "aero_c5e5":    ("0xc5e51044eb7318950b1afb044fccfb25782c48c1", 30, 6, 6),  # 30bp tier ($219k TVL)
-    "pancake_1ca4": ("0x1ca42c7219f0cb1b67927e26502320cb98f725bd", 1,  6, 6),  # PancakeSwap v3, EURC/USDC, $190k
-    "aero_183c":    ("0x183cefd0928ea4d54c9d726dd975fab561705c86", 5,  6, 6),  # Aerodrome, EURAU/USDC (diff EUR issuer)
-    "alien_7b2c":   ("0x7b2c99188d8ec7b82d6b3b3b1c1002095f1b8498", 1,  6, 6),  # AlienBase v3, EURC/USDC, $112k
-    "uni_7279":     ("0x7279c08a36333e12c3fc81747963264c100d66fb", 5,  6, 6),  # Uniswap v3, EURC/USDC, $94k
-    "pancake_f0c5": ("0xf0c559af52bce48b3f3710604a59b4feaefd5555", 1,  6, 6),  # PancakeSwap v3, EURC/USDT (diff USD stable)
-    "uni_03d8":     ("0x03d8219070e54a55a9ce60889ead2ffd18eb6aa9", 30, 6, 6),  # Uniswap v3, EURC/USDC, $12k (dust)
+    "aero_e846":    {"kind": "v3", "addr": "0xe846373c1a92b167b4e9cd5d8e4d6b1db9e90ec7", "fee_bps": 5,  "dec0": 6, "dec1": 6},  # deepest TVL ($2.87M), canonical mid
+    "aero_f39b":    {"kind": "v3", "addr": "0xf39b7c34be147f5dc1bc374f27af2e9f03ad3113", "fee_bps": 1,  "dec0": 6, "dec1": 6},  # 1bp tier, highest volume
+    "aero_c5e5":    {"kind": "v3", "addr": "0xc5e51044eb7318950b1afb044fccfb25782c48c1", "fee_bps": 30, "dec0": 6, "dec1": 6},  # 30bp tier ($219k TVL)
+    "pancake_1ca4": {"kind": "v3", "addr": "0x1ca42c7219f0cb1b67927e26502320cb98f725bd", "fee_bps": 1,  "dec0": 6, "dec1": 6},  # PancakeSwap v3, EURC/USDC, $190k
+    "aero_183c":    {"kind": "v3", "addr": "0x183cefd0928ea4d54c9d726dd975fab561705c86", "fee_bps": 5,  "dec0": 6, "dec1": 6},  # Aerodrome, EURAU/USDC (diff EUR issuer)
+    "alien_7b2c":   {"kind": "v3", "addr": "0x7b2c99188d8ec7b82d6b3b3b1c1002095f1b8498", "fee_bps": 1,  "dec0": 6, "dec1": 6},  # AlienBase v3, EURC/USDC, $112k
+    "uni_7279":     {"kind": "v3", "addr": "0x7279c08a36333e12c3fc81747963264c100d66fb", "fee_bps": 5,  "dec0": 6, "dec1": 6},  # Uniswap v3, EURC/USDC, $94k
+    "pancake_f0c5": {"kind": "v3", "addr": "0xf0c559af52bce48b3f3710604a59b4feaefd5555", "fee_bps": 1,  "dec0": 6, "dec1": 6},  # PancakeSwap v3, EURC/USDT (diff USD stable)
+    "uni_03d8":     {"kind": "v3", "addr": "0x03d8219070e54a55a9ce60889ead2ffd18eb6aa9", "fee_bps": 30, "dec0": 6, "dec1": 6},  # Uniswap v3, EURC/USDC, $12k (dust)
+    # Uniswap v4 (singleton, poolId-keyed). EURC/USDC 5bp/tickSpacing-10, no hook. ~$7k/28h, mid==v3.
+    "univ4_64db":   {"kind": "v4", "pool_id": "0x64db64264317af2fa1cc5a5deff9900dcf504d426580ab16dc59279b4ade4423", "fee_bps": 5, "dec0": 6, "dec1": 6},  # Uniswap v4, EURC/USDC (watch-only)
 }
 
-# function selectors
+# v3 function selectors (called on the pool contract address)
 SEL_SLOT0 = "0x3850c7bd"           # slot0()
 SEL_LIQUIDITY = "0x1a686502"       # liquidity()
 SEL_OBSERVE = "0x883bdbfd"         # observe(uint32[])
@@ -122,22 +145,33 @@ def gas_price_gwei() -> float:
 
 
 def spot_mid(label: str) -> float:
-    """slot0() sqrtPriceX96 -> spot mid (USD/EUR). BREAKER USE ONLY - never the position mark (F1)."""
-    addr, _, d0, d1 = POOLS[label]
-    sqrtP = _u(_words(_call(addr, SEL_SLOT0))[0])
-    return (sqrtP / Q96) ** 2 * 10 ** (d0 - d1)
+    """Spot mid (USD/EUR) from sqrtPriceX96. BREAKER USE ONLY - never the position mark (F1).
+    v3: slot0() on the pool. v4: StateView.getSlot0(poolId) word[0]."""
+    p = POOLS[label]
+    if p["kind"] == "v4":
+        sqrtP = _u(_words(_call(V4_STATEVIEW, SEL_GETSLOT0 + p["pool_id"][2:]))[0])
+    else:
+        sqrtP = _u(_words(_call(p["addr"], SEL_SLOT0))[0])
+    return (sqrtP / Q96) ** 2 * 10 ** (p["dec0"] - p["dec1"])
 
 
 def liquidity_active(label: str) -> int:
-    """liquidity() -> in-range L (raw pool units). Denominator of the F2 L-unit fee share."""
-    addr = POOLS[label][0]
-    return _u(_words(_call(addr, SEL_LIQUIDITY))[0])
+    """In-range L (raw pool units). Denominator of the F2 L-unit fee share.
+    v3: liquidity() on the pool. v4: StateView.getLiquidity(poolId)."""
+    p = POOLS[label]
+    if p["kind"] == "v4":
+        return _u(_words(_call(V4_STATEVIEW, SEL_GETLIQUIDITY + p["pool_id"][2:]))[0])
+    return _u(_words(_call(p["addr"], SEL_LIQUIDITY))[0])
 
 
 def twap_mid(label: str, window_s: int = TWAP_S) -> float:
     """observe([window,0]) -> time-weighted avg mid over the last `window_s` (the ROBUST mark, F1).
-    Falls back to spot only if the pool has no oracle cardinality (raises differently)."""
-    addr, _, d0, d1 = POOLS[label]
+    Falls back to spot only if the pool has no oracle cardinality (raises differently).
+    v4 has NO observe() (singleton, no per-pool oracle) -> raise so poll_pool marks on spot (mark_is_spot)."""
+    p = POOLS[label]
+    if p["kind"] == "v4":
+        raise RPCError("v4 singleton has no observe() oracle; mark on spot")
+    addr, d0, d1 = p["addr"], p["dec0"], p["dec1"]
     data = (SEL_OBSERVE
             + "0000000000000000000000000000000000000000000000000000000000000020"   # offset to array
             + format(2, "064x")                                                    # array length = 2
@@ -152,24 +186,33 @@ def twap_mid(label: str, window_s: int = TWAP_S) -> float:
 
 def swap_volume_since(label: str, from_block: int, to_block: int) -> dict:
     """Sum USD volume of Swap events in (from_block, to_block], chunked for public-RPC span limits.
-    USD per swap = |amount1| / 10^dec1 (token1 = USDC). Returns {volume_usd, n_swaps, to_block}.
+    USD per swap = |amount1| / 10^dec1 (token1 = USD stable, amount1 is data word[1] in BOTH v3 and v4).
+    Returns {volume_usd, n_swaps, to_block}.
+
+    v3: query the pool address, topic [v3 Swap]. v4: query the PoolManager, topic [v4 Swap, poolId] so
+    only this pool's swaps come back (the singleton firehose is filtered server-side by topic1).
 
     Self-healing (F5): the caller persists `to_block` as the next `from_block`, so a delayed or missed
     tick just widens the window instead of dropping or double-counting volume."""
-    addr, _, _, d1 = POOLS[label]
+    p = POOLS[label]
+    d1 = p["dec1"]
     if to_block <= from_block:
         return {"volume_usd": 0.0, "n_swaps": 0, "to_block": to_block}
+    if p["kind"] == "v4":
+        log_addr, topics = V4_POOL_MANAGER, [V4_SWAP_TOPIC0, p["pool_id"]]
+    else:
+        log_addr, topics = p["addr"], [SWAP_TOPIC0]
     vol, n = 0.0, 0
     lo = from_block + 1
     while lo <= to_block:
         hi = min(lo + GETLOGS_CHUNK - 1, to_block)
-        logs = _rpc("eth_getLogs", [{"address": addr, "topics": [SWAP_TOPIC0],
+        logs = _rpc("eth_getLogs", [{"address": log_addr, "topics": topics,
                                      "fromBlock": hex(lo), "toBlock": hex(hi)}]).get("result", [])
         for lg in logs:
             w = _words(lg["data"])
             if len(w) < 5:
                 continue
-            amount1 = _s(w[1])                 # int256 USDC raw, signed
+            amount1 = _s(w[1])                 # int128/int256 USD raw, signed (word[1] in v3 and v4)
             vol += abs(amount1) / 10 ** d1
             n += 1
         lo = hi + 1
@@ -180,7 +223,9 @@ def swap_volume_since(label: str, from_block: int, to_block: int) -> dict:
 def poll_pool(label: str, from_block: int | None, to_block: int) -> dict:
     """One pool's full observation for a tick. from_block=None on first sight -> volume window starts now
     (no retro-volume). Any individual read failing is surfaced as ok=False so the breaker can FREEZE."""
-    obs = {"label": label, "addr": POOLS[label][0], "fee_bps": POOLS[label][1], "ok": True, "errors": []}
+    p = POOLS[label]
+    obs = {"label": label, "kind": p["kind"], "addr": p.get("addr") or p.get("pool_id"),
+           "fee_bps": p["fee_bps"], "ok": True, "errors": []}
     try:
         obs["mark_mid"] = twap_mid(label)
     except Exception as e:
