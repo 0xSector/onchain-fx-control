@@ -10462,15 +10462,15 @@
     }
   ],
   "n_reallocations": 13,
-  "n_ticks": 572,
+  "n_ticks": 573,
   "breaker": {
-    "state": "FX_CLOSED",
-    "reason": "no_bars (FX-closed?)",
+    "state": "STALE",
+    "reason": "feed read failed: ['aero_c5e5', 'uni_7279']",
     "dev_bps": null,
     "thresh_bps": null,
-    "since": 1784323959
+    "since": 1784327471
   },
-  "last_tick_ts": 1784323959,
+  "last_tick_ts": 1784327471,
   "hedge_enabled": true,
   "hedge": {
     "notional_usd": 4894.148217687558,
