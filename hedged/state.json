@@ -28372,15 +28372,15 @@
     }
   ],
   "n_reallocations": 25,
-  "n_ticks": 1568,
+  "n_ticks": 1569,
   "breaker": {
-    "state": "FX_CLOSED",
-    "reason": "fetch_error:HTTP Error 404: Not Found",
+    "state": "STALE",
+    "reason": "feed read failed: ['aero_e846', 'aero_f39b', 'aero_c5e5', 'pancake_1ca4', 'aero_183c', 'alien_7b2c', 'uni_7279', 'pancake_f0c5', 'uni_03d8', 'univ4_64db']",
     "dev_bps": null,
     "thresh_bps": null,
-    "since": 1787763023
+    "since": 1788978949
   },
-  "last_tick_ts": 1788966393,
+  "last_tick_ts": 1788978949,
   "hedge_enabled": true,
   "hedge": {
     "notional_usd": 4932.46121790386,
