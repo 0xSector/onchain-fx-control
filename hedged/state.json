@@ -28372,7 +28372,7 @@
     }
   ],
   "n_reallocations": 25,
-  "n_ticks": 1571,
+  "n_ticks": 1572,
   "breaker": {
     "state": "STALE",
     "reason": "feed read failed: ['aero_e846', 'aero_f39b', 'aero_c5e5', 'pancake_1ca4', 'aero_183c', 'alien_7b2c', 'uni_7279', 'pancake_f0c5', 'uni_03d8', 'univ4_64db']",
@@ -28380,7 +28380,7 @@
     "thresh_bps": null,
     "since": 1788978949
   },
-  "last_tick_ts": 1788995715,
+  "last_tick_ts": 1789002465,
   "hedge_enabled": true,
   "hedge": {
     "notional_usd": 4932.46121790386,
