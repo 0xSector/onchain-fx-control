@@ -12972,7 +12972,7 @@
     }
   ],
   "n_reallocations": 23,
-  "n_ticks": 1577,
+  "n_ticks": 1578,
   "breaker": {
     "state": "STALE",
     "reason": "feed read failed: ['aero_e846', 'aero_f39b', 'aero_c5e5', 'pancake_1ca4', 'aero_183c', 'alien_7b2c', 'uni_7279', 'pancake_f0c5', 'uni_03d8', 'univ4_64db']",
@@ -12980,5 +12980,5 @@
     "thresh_bps": null,
     "since": 1788978893
   },
-  "last_tick_ts": 1789080907
+  "last_tick_ts": 1789087697
 }
